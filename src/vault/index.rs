@@ -210,10 +210,10 @@ impl VaultIndex {
         for (tag, paths) in &self.tags {
             if tag == prefix || tag.starts_with(&nested_prefix) {
                 for path in paths {
-                    if seen.insert(path) {
-                        if let Some(note) = self.notes.get(path) {
-                            results.push(note);
-                        }
+                    if seen.insert(path)
+                        && let Some(note) = self.notes.get(path)
+                    {
+                        results.push(note);
                     }
                 }
             }
