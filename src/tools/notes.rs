@@ -153,3 +153,283 @@ pub async fn note_move(vault: &Vault, params: NoteMoveParams) -> Result<String, 
     let new_path = vault.move_note(Path::new(&params.from), Path::new(&params.to))?;
     Ok(format!("Moved to: {}", new_path.display()))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+    use crate::config::Config;
+    use crate::vault::Vault;
+
+    fn test_config(vault_root: &Path) -> Config {
+        Config {
+            vault_path: vault_root.to_path_buf(),
+            watch: false,
+            log_level: "error".into(),
+        }
+    }
+
+    fn create_test_vault(dir: &Path) {
+        std::fs::create_dir_all(dir.join(".obsidian")).unwrap();
+    }
+
+    // ── note_read ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn read_existing_note() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+        vault
+            .write_note(Path::new("hello.md"), "# Hello\nWorld")
+            .unwrap();
+
+        let content = note_read(
+            &vault,
+            NoteReadParams {
+                path: "hello.md".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(content, "# Hello\nWorld");
+    }
+
+    #[tokio::test]
+    async fn read_nonexistent_note_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+
+        let result = note_read(
+            &vault,
+            NoteReadParams {
+                path: "missing.md".into(),
+            },
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    // ── note_create ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn create_new_note() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+
+        let msg = note_create(
+            &vault,
+            NoteCreateParams {
+                path: "new.md".into(),
+                content: Some("body".into()),
+                frontmatter: Some(serde_json::json!({"status": "draft"})),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(msg.contains("new.md"));
+
+        let content = vault.read_note(Path::new("new.md")).unwrap();
+        assert!(content.contains("body"));
+        assert!(content.contains("status"));
+    }
+
+    #[tokio::test]
+    async fn create_duplicate_note_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+
+        note_create(
+            &vault,
+            NoteCreateParams {
+                path: "dup.md".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = note_create(
+            &vault,
+            NoteCreateParams {
+                path: "dup.md".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    // ── note_write ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn write_overwrites_content() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+        vault
+            .write_note(Path::new("note.md"), "old content")
+            .unwrap();
+
+        note_write(
+            &vault,
+            NoteWriteParams {
+                path: "note.md".into(),
+                content: "new content".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let content = vault.read_note(Path::new("note.md")).unwrap();
+        assert_eq!(content, "new content");
+    }
+
+    // ── note_append ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn append_adds_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+        vault.write_note(Path::new("note.md"), "start").unwrap();
+
+        note_append(
+            &vault,
+            NoteAppendParams {
+                path: "note.md".into(),
+                content: "\nmore".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let content = vault.read_note(Path::new("note.md")).unwrap();
+        assert!(content.ends_with("more"));
+        assert!(content.starts_with("start"));
+    }
+
+    // ── note_prepend ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn prepend_inserts_after_frontmatter() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+        vault
+            .write_note(Path::new("note.md"), "---\ntags: [a]\n---\n# Heading\n")
+            .unwrap();
+
+        note_prepend(
+            &vault,
+            NotePrependParams {
+                path: "note.md".into(),
+                content: "injected\n".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let content = vault.read_note(Path::new("note.md")).unwrap();
+        assert!(content.starts_with("---\ntags:"));
+        assert!(content.contains("injected"));
+        assert!(content.contains("# Heading"));
+    }
+
+    // ── note_patch ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn patch_heading_append() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+        vault
+            .write_note(Path::new("patched.md"), "# Title\nBody\n## Sub\nSub body\n")
+            .unwrap();
+
+        note_patch(
+            &vault,
+            NotePatchParams {
+                path: "patched.md".into(),
+                operation: PatchOperation::Append,
+                target_type: PatchTargetType::Heading,
+                target: "Sub".into(),
+                content: "appended\n".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let content = vault.read_note(Path::new("patched.md")).unwrap();
+        assert!(content.contains("Sub body"));
+        assert!(content.contains("appended"));
+    }
+
+    // ── note_delete ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_requires_confirm() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+        vault.write_note(Path::new("note.md"), "content").unwrap();
+
+        let result = note_delete(
+            &vault,
+            NoteDeleteParams {
+                path: "note.md".into(),
+                confirm: false,
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(vault.read_note(Path::new("note.md")).is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_with_confirm_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+        vault.write_note(Path::new("note.md"), "content").unwrap();
+
+        note_delete(
+            &vault,
+            NoteDeleteParams {
+                path: "note.md".into(),
+                confirm: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(vault.read_note(Path::new("note.md")).is_err());
+    }
+
+    // ── note_move ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn move_renames_note() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+        vault.write_note(Path::new("old.md"), "content").unwrap();
+
+        let msg = note_move(
+            &vault,
+            NoteMoveParams {
+                from: "old.md".into(),
+                to: "new.md".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(msg.contains("new.md"));
+
+        assert!(vault.read_note(Path::new("old.md")).is_err());
+        assert_eq!(vault.read_note(Path::new("new.md")).unwrap(), "content");
+    }
+}

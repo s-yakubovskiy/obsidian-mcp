@@ -2,10 +2,11 @@
 
 use std::path::{Path, PathBuf};
 
+use rmcp::model::{CallToolResult, Content};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::error::VaultResult;
+use crate::error::VaultError;
 use crate::vault::Vault;
 
 // ── param structs ───────────────────────────────────────────────────
@@ -77,13 +78,23 @@ pub struct BrokenLink {
 
 // ── handler functions ───────────────────────────────────────────────
 
+fn to_json_text(value: &impl Serialize) -> Result<CallToolResult, rmcp::ErrorData> {
+    let json = serde_json::to_string_pretty(value)
+        .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))?;
+    Ok(CallToolResult::success(vec![Content::text(json)]))
+}
+
 /// Find all notes linking TO a given note, with the specific wikilinks used.
-pub fn get_backlinks(vault: &Vault, path: &Path) -> VaultResult<Vec<BacklinkSource>> {
+pub async fn links_backlinks(
+    vault: &Vault,
+    params: LinksBacklinksParams,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    let path = Path::new(&params.path);
     vault.get_note_metadata(path)?;
 
     let backlink_notes = vault.backlinks(path)?;
 
-    let result = backlink_notes
+    let result: Vec<BacklinkSource> = backlink_notes
         .iter()
         .filter_map(|source| {
             let matching: Vec<BacklinkRef> = source
@@ -107,16 +118,20 @@ pub fn get_backlinks(vault: &Vault, path: &Path) -> VaultResult<Vec<BacklinkSour
         })
         .collect();
 
-    Ok(result)
+    to_json_text(&result)
 }
 
 /// Find all outgoing links FROM a given note, with resolution status.
-pub fn get_outgoing_links(vault: &Vault, path: &Path) -> VaultResult<Vec<OutgoingLink>> {
+pub async fn links_outgoing(
+    vault: &Vault,
+    params: LinksOutgoingParams,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    let path = Path::new(&params.path);
     vault.get_note_metadata(path)?;
 
     let links = vault.outgoing_links(path)?;
 
-    let result = links
+    let result: Vec<OutgoingLink> = links
         .into_iter()
         .map(|link| {
             let resolved_path = vault.resolve_link(&link.target);
@@ -131,41 +146,55 @@ pub fn get_outgoing_links(vault: &Vault, path: &Path) -> VaultResult<Vec<Outgoin
         })
         .collect();
 
-    Ok(result)
+    to_json_text(&result)
 }
 
 /// Find all broken (unresolved) wikilinks, optionally filtered to a single note.
-pub fn get_broken_links(vault: &Vault, path: Option<&Path>) -> VaultResult<Vec<BrokenLink>> {
-    if let Some(p) = path {
-        vault.get_note_metadata(p)?;
-        let links = vault.outgoing_links(p)?;
+pub async fn links_broken(
+    vault: &Vault,
+    params: LinksBrokenParams,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    let result: Vec<BrokenLink> = match params.path.as_deref() {
+        Some(p) => {
+            let path = Path::new(p);
+            vault.get_note_metadata(path)?;
+            let links = vault.outgoing_links(path)?;
 
-        Ok(links
-            .into_iter()
-            .filter(|link| !link.target.is_empty() && vault.resolve_link(&link.target).is_none())
-            .map(|link| BrokenLink {
-                source_path: p.to_path_buf(),
-                link_raw: link.raw,
-                target: link.target,
-            })
-            .collect())
-    } else {
-        let all = vault.broken_links()?;
-        Ok(all
-            .into_iter()
-            .map(|(source_path, link)| BrokenLink {
-                source_path,
-                link_raw: link.raw,
-                target: link.target,
-            })
-            .collect())
-    }
+            links
+                .into_iter()
+                .filter(|link| {
+                    !link.target.is_empty() && vault.resolve_link(&link.target).is_none()
+                })
+                .map(|link| BrokenLink {
+                    source_path: path.to_path_buf(),
+                    link_raw: link.raw,
+                    target: link.target,
+                })
+                .collect()
+        }
+        None => {
+            let all = vault.broken_links()?;
+            all.into_iter()
+                .map(|(source_path, link)| BrokenLink {
+                    source_path,
+                    link_raw: link.raw,
+                    target: link.target,
+                })
+                .collect()
+        }
+    };
+
+    to_json_text(&result)
 }
 
 /// Find notes with no inbound and no outbound links.
-pub fn get_orphan_notes(vault: &Vault) -> VaultResult<Vec<PathBuf>> {
+pub async fn links_orphans(
+    vault: &Vault,
+    _params: LinksOrphansParams,
+) -> Result<CallToolResult, rmcp::ErrorData> {
     let orphans = vault.orphan_notes()?;
-    Ok(orphans.into_iter().map(|n| n.path).collect())
+    let paths: Vec<PathBuf> = orphans.into_iter().map(|n| n.path).collect();
+    to_json_text(&paths)
 }
 
 #[cfg(test)]
@@ -196,25 +225,46 @@ mod tests {
         std::fs::write(dir.join("orphan.md"), "# Orphan\n\nNo links here.\n").unwrap();
     }
 
+    fn extract_text(result: &CallToolResult) -> &str {
+        result.content[0]
+            .as_text()
+            .expect("expected text content")
+            .text
+            .as_str()
+    }
+
     #[tokio::test]
     async fn backlinks_returns_correct_sources_and_refs() {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        let backlinks = get_backlinks(&vault, Path::new("a.md")).unwrap();
+        let result = links_backlinks(
+            &vault,
+            LinksBacklinksParams {
+                path: "a.md".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let text = extract_text(&result);
+        let backlinks: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
 
-        let source_paths: Vec<&PathBuf> = backlinks.iter().map(|bl| &bl.source_path).collect();
-        assert!(source_paths.contains(&&PathBuf::from("b.md")));
-        assert!(source_paths.contains(&&PathBuf::from("c.md")));
-        assert!(source_paths.contains(&&PathBuf::from("d.md")));
+        let source_paths: Vec<&str> = backlinks
+            .iter()
+            .filter_map(|bl| bl["source_path"].as_str())
+            .collect();
+        assert!(source_paths.contains(&"b.md"));
+        assert!(source_paths.contains(&"c.md"));
+        assert!(source_paths.contains(&"d.md"));
 
         let b_entry = backlinks
             .iter()
-            .find(|bl| bl.source_path == PathBuf::from("b.md"))
+            .find(|bl| bl["source_path"] == "b.md")
             .unwrap();
-        assert_eq!(b_entry.links.len(), 1);
-        assert!(b_entry.links[0].raw.contains("[[a]]"));
+        let b_links = b_entry["links"].as_array().unwrap();
+        assert_eq!(b_links.len(), 1);
+        assert!(b_links[0]["raw"].as_str().unwrap().contains("[[a]]"));
     }
 
     #[tokio::test]
@@ -223,7 +273,16 @@ mod tests {
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        assert!(get_backlinks(&vault, Path::new("nonexistent.md")).is_err());
+        assert!(
+            links_backlinks(
+                &vault,
+                LinksBacklinksParams {
+                    path: "nonexistent.md".into()
+                },
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -232,7 +291,16 @@ mod tests {
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        let backlinks = get_backlinks(&vault, Path::new("orphan.md")).unwrap();
+        let result = links_backlinks(
+            &vault,
+            LinksBacklinksParams {
+                path: "orphan.md".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let text = extract_text(&result);
+        let backlinks: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
         assert!(backlinks.is_empty());
     }
 
@@ -242,29 +310,47 @@ mod tests {
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        let links = get_outgoing_links(&vault, Path::new("a.md")).unwrap();
+        let result = links_outgoing(
+            &vault,
+            LinksOutgoingParams {
+                path: "a.md".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let text = extract_text(&result);
+        let links: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
         assert_eq!(links.len(), 2);
 
-        let b_link = links.iter().find(|l| l.target == "b").unwrap();
-        assert_eq!(b_link.resolved_path, Some(PathBuf::from("b.md")));
+        let b_link = links.iter().find(|l| l["target"] == "b").unwrap();
+        assert_eq!(b_link["resolved_path"], "b.md");
 
-        let c_link = links.iter().find(|l| l.target == "c").unwrap();
-        assert_eq!(c_link.resolved_path, Some(PathBuf::from("c.md")));
+        let c_link = links.iter().find(|l| l["target"] == "c").unwrap();
+        assert_eq!(c_link["resolved_path"], "c.md");
     }
 
     #[tokio::test]
-    async fn outgoing_links_broken_shown_as_none() {
+    async fn outgoing_links_broken_shown_as_null() {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        let links = get_outgoing_links(&vault, Path::new("d.md")).unwrap();
+        let result = links_outgoing(
+            &vault,
+            LinksOutgoingParams {
+                path: "d.md".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let text = extract_text(&result);
+        let links: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
 
-        let broken = links.iter().find(|l| l.target == "nonexistent").unwrap();
-        assert!(broken.resolved_path.is_none());
+        let broken = links.iter().find(|l| l["target"] == "nonexistent").unwrap();
+        assert!(broken["resolved_path"].is_null());
 
-        let resolved = links.iter().find(|l| l.target == "a").unwrap();
-        assert_eq!(resolved.resolved_path, Some(PathBuf::from("a.md")));
+        let resolved = links.iter().find(|l| l["target"] == "a").unwrap();
+        assert_eq!(resolved["resolved_path"], "a.md");
     }
 
     #[tokio::test]
@@ -273,12 +359,21 @@ mod tests {
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        let links = get_outgoing_links(&vault, Path::new("c.md")).unwrap();
+        let result = links_outgoing(
+            &vault,
+            LinksOutgoingParams {
+                path: "c.md".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let text = extract_text(&result);
+        let links: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
         assert_eq!(links.len(), 1);
-        assert_eq!(links[0].target, "a");
-        assert_eq!(links[0].heading.as_deref(), Some("heading"));
-        assert_eq!(links[0].alias.as_deref(), Some("alias"));
-        assert_eq!(links[0].resolved_path, Some(PathBuf::from("a.md")));
+        assert_eq!(links[0]["target"], "a");
+        assert_eq!(links[0]["heading"], "heading");
+        assert_eq!(links[0]["alias"], "alias");
+        assert_eq!(links[0]["resolved_path"], "a.md");
     }
 
     #[tokio::test]
@@ -287,7 +382,16 @@ mod tests {
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        assert!(get_outgoing_links(&vault, Path::new("nonexistent.md")).is_err());
+        assert!(
+            links_outgoing(
+                &vault,
+                LinksOutgoingParams {
+                    path: "nonexistent.md".into()
+                },
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -296,14 +400,14 @@ mod tests {
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        let broken = get_broken_links(&vault, None).unwrap();
+        let result = links_broken(&vault, LinksBrokenParams::default())
+            .await
+            .unwrap();
+        let text = extract_text(&result);
+        let broken: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
         assert!(!broken.is_empty());
-        assert!(broken.iter().any(|bl| bl.target == "nonexistent"));
-        assert!(
-            broken
-                .iter()
-                .any(|bl| bl.source_path == PathBuf::from("d.md"))
-        );
+        assert!(broken.iter().any(|bl| bl["target"] == "nonexistent"));
+        assert!(broken.iter().any(|bl| bl["source_path"] == "d.md"));
     }
 
     #[tokio::test]
@@ -312,9 +416,18 @@ mod tests {
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        let broken = get_broken_links(&vault, Some(Path::new("d.md"))).unwrap();
+        let result = links_broken(
+            &vault,
+            LinksBrokenParams {
+                path: Some("d.md".into()),
+            },
+        )
+        .await
+        .unwrap();
+        let text = extract_text(&result);
+        let broken: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
         assert_eq!(broken.len(), 1);
-        assert_eq!(broken[0].target, "nonexistent");
+        assert_eq!(broken[0]["target"], "nonexistent");
     }
 
     #[tokio::test]
@@ -323,7 +436,16 @@ mod tests {
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        let broken = get_broken_links(&vault, Some(Path::new("a.md"))).unwrap();
+        let result = links_broken(
+            &vault,
+            LinksBrokenParams {
+                path: Some("a.md".into()),
+            },
+        )
+        .await
+        .unwrap();
+        let text = extract_text(&result);
+        let broken: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
         assert!(broken.is_empty());
     }
 
@@ -333,7 +455,16 @@ mod tests {
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        assert!(get_broken_links(&vault, Some(Path::new("nonexistent.md"))).is_err());
+        assert!(
+            links_broken(
+                &vault,
+                LinksBrokenParams {
+                    path: Some("nonexistent.md".into()),
+                },
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -342,12 +473,14 @@ mod tests {
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        let orphans = get_orphan_notes(&vault).unwrap();
-        assert!(orphans.contains(&PathBuf::from("orphan.md")));
+        let result = links_orphans(&vault, LinksOrphansParams {}).await.unwrap();
+        let text = extract_text(&result);
+        let orphans: Vec<String> = serde_json::from_str(text).unwrap();
 
-        assert!(!orphans.contains(&PathBuf::from("a.md")));
-        assert!(!orphans.contains(&PathBuf::from("b.md")));
-        assert!(!orphans.contains(&PathBuf::from("c.md")));
+        assert!(orphans.contains(&"orphan.md".to_string()));
+        assert!(!orphans.contains(&"a.md".to_string()));
+        assert!(!orphans.contains(&"b.md".to_string()));
+        assert!(!orphans.contains(&"c.md".to_string()));
     }
 
     #[tokio::test]
@@ -356,8 +489,9 @@ mod tests {
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        let orphans = get_orphan_notes(&vault).unwrap();
-        // d.md has outgoing links even though nothing links to it
-        assert!(!orphans.contains(&PathBuf::from("d.md")));
+        let result = links_orphans(&vault, LinksOrphansParams {}).await.unwrap();
+        let text = extract_text(&result);
+        let orphans: Vec<String> = serde_json::from_str(text).unwrap();
+        assert!(!orphans.contains(&"d.md".to_string()));
     }
 }

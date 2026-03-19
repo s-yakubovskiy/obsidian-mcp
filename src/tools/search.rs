@@ -1,9 +1,10 @@
 //! Text, regex, tag, and frontmatter search tools across vault notes.
 
+use rmcp::model::{CallToolResult, Content, ErrorCode};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::error::{VaultError, VaultResult};
+use crate::error::VaultError;
 use crate::vault::Vault;
 
 // ── search_text ─────────────────────────────────────────────────────
@@ -20,15 +21,19 @@ pub struct SearchTextParams {
     pub max_results: Option<usize>,
 }
 
-pub fn handle_search_text(vault: &Vault, params: SearchTextParams) -> VaultResult<String> {
+pub async fn search_text(
+    vault: &Vault,
+    params: SearchTextParams,
+) -> Result<CallToolResult, rmcp::ErrorData> {
     let context_length = params.context_length.unwrap_or(100);
     let max_results = params.max_results.unwrap_or(20);
 
     let results = vault.search_text(&params.query, context_length)?;
     let limited: Vec<_> = results.into_iter().take(max_results).collect();
 
-    serde_json::to_string_pretty(&limited)
-        .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))
+    let json = serde_json::to_string_pretty(&limited)
+        .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))?;
+    Ok(CallToolResult::success(vec![Content::text(json)]))
 }
 
 // ── search_regex ────────────────────────────────────────────────────
@@ -45,15 +50,19 @@ pub struct SearchRegexParams {
     pub max_results: Option<usize>,
 }
 
-pub fn handle_search_regex(vault: &Vault, params: SearchRegexParams) -> VaultResult<String> {
+pub async fn search_regex(
+    vault: &Vault,
+    params: SearchRegexParams,
+) -> Result<CallToolResult, rmcp::ErrorData> {
     let context_length = params.context_length.unwrap_or(100);
     let max_results = params.max_results.unwrap_or(20);
 
     let results = vault.search_regex(&params.pattern, context_length)?;
     let limited: Vec<_> = results.into_iter().take(max_results).collect();
 
-    serde_json::to_string_pretty(&limited)
-        .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))
+    let json = serde_json::to_string_pretty(&limited)
+        .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))?;
+    Ok(CallToolResult::success(vec![Content::text(json)]))
 }
 
 // ── search_tag ──────────────────────────────────────────────────────
@@ -67,7 +76,10 @@ pub struct SearchTagParams {
     pub include_nested: Option<bool>,
 }
 
-pub fn handle_search_tag(vault: &Vault, params: SearchTagParams) -> VaultResult<String> {
+pub async fn search_tag(
+    vault: &Vault,
+    params: SearchTagParams,
+) -> Result<CallToolResult, rmcp::ErrorData> {
     let tag = params.tag.strip_prefix('#').unwrap_or(&params.tag);
     let include_nested = params.include_nested.unwrap_or(true);
 
@@ -77,8 +89,9 @@ pub fn handle_search_tag(vault: &Vault, params: SearchTagParams) -> VaultResult<
         vault.search_by_tag(tag)?
     };
 
-    serde_json::to_string_pretty(&results)
-        .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))
+    let json = serde_json::to_string_pretty(&results)
+        .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))?;
+    Ok(CallToolResult::success(vec![Content::text(json)]))
 }
 
 // ── search_frontmatter ─────────────────────────────────────────────
@@ -107,28 +120,37 @@ pub struct SearchFrontmatterParams {
     pub operator: FrontmatterOperator,
 }
 
-pub fn handle_search_frontmatter(
+pub async fn search_frontmatter(
     vault: &Vault,
     params: SearchFrontmatterParams,
-) -> VaultResult<String> {
+) -> Result<CallToolResult, rmcp::ErrorData> {
     let results = match params.operator {
         FrontmatterOperator::Exists => vault.search_frontmatter_exists(&params.field)?,
         FrontmatterOperator::Eq => {
             let value = params.value.ok_or_else(|| {
-                VaultError::InvalidPath("'value' is required for 'eq' operator".into())
+                rmcp::ErrorData::new(
+                    ErrorCode::INVALID_PARAMS,
+                    "'value' is required for 'eq' operator",
+                    None::<serde_json::Value>,
+                )
             })?;
             vault.search_frontmatter(&params.field, &value)?
         }
         FrontmatterOperator::Contains => {
             let value = params.value.ok_or_else(|| {
-                VaultError::InvalidPath("'value' is required for 'contains' operator".into())
+                rmcp::ErrorData::new(
+                    ErrorCode::INVALID_PARAMS,
+                    "'value' is required for 'contains' operator",
+                    None::<serde_json::Value>,
+                )
             })?;
             vault.search_frontmatter_contains(&params.field, &value)?
         }
     };
 
-    serde_json::to_string_pretty(&results)
-        .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))
+    let json = serde_json::to_string_pretty(&results)
+        .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))?;
+    Ok(CallToolResult::success(vec![Content::text(json)]))
 }
 
 // ── tests ───────────────────────────────────────────────────────────
@@ -150,6 +172,14 @@ mod tests {
 
     fn create_test_vault(dir: &Path) {
         std::fs::create_dir_all(dir.join(".obsidian")).unwrap();
+    }
+
+    fn extract_text(result: &CallToolResult) -> &str {
+        result.content[0]
+            .as_text()
+            .expect("expected text content")
+            .text
+            .as_str()
     }
 
     async fn setup_search_vault() -> (tempfile::TempDir, Vault) {
@@ -191,23 +221,25 @@ mod tests {
     #[tokio::test]
     async fn search_text_finds_match() {
         let (_dir, vault) = setup_search_vault().await;
-        let result = handle_search_text(
+        let result = search_text(
             &vault,
             SearchTextParams {
                 query: "systems".into(),
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
+        let text = extract_text(&result);
 
-        assert!(result.contains("rust.md"));
-        assert!(!result.contains("python.md"));
+        assert!(text.contains("rust.md"));
+        assert!(!text.contains("python.md"));
     }
 
     #[tokio::test]
     async fn search_text_limits_results() {
         let (_dir, vault) = setup_search_vault().await;
-        let result = handle_search_text(
+        let result = search_text(
             &vault,
             SearchTextParams {
                 query: "is".into(),
@@ -215,25 +247,29 @@ mod tests {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
+        let text = extract_text(&result);
 
-        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
         assert_eq!(parsed.len(), 1);
     }
 
     #[tokio::test]
     async fn search_text_empty_query_returns_empty() {
         let (_dir, vault) = setup_search_vault().await;
-        let result = handle_search_text(
+        let result = search_text(
             &vault,
             SearchTextParams {
                 query: String::new(),
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
+        let text = extract_text(&result);
 
-        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
         assert!(parsed.is_empty());
     }
 
@@ -242,28 +278,31 @@ mod tests {
     #[tokio::test]
     async fn search_regex_valid_pattern() {
         let (_dir, vault) = setup_search_vault().await;
-        let result = handle_search_regex(
+        let result = search_regex(
             &vault,
             SearchRegexParams {
                 pattern: r"(?i)python".into(),
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
+        let text = extract_text(&result);
 
-        assert!(result.contains("python.md"));
+        assert!(text.contains("python.md"));
     }
 
     #[tokio::test]
     async fn search_regex_invalid_pattern_returns_error() {
         let (_dir, vault) = setup_search_vault().await;
-        let result = handle_search_regex(
+        let result = search_regex(
             &vault,
             SearchRegexParams {
                 pattern: "[invalid".into(),
                 ..Default::default()
             },
-        );
+        )
+        .await;
 
         assert!(result.is_err());
     }
@@ -271,7 +310,7 @@ mod tests {
     #[tokio::test]
     async fn search_regex_limits_results() {
         let (_dir, vault) = setup_search_vault().await;
-        let result = handle_search_regex(
+        let result = search_regex(
             &vault,
             SearchRegexParams {
                 pattern: r"\w+".into(),
@@ -279,9 +318,11 @@ mod tests {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
+        let text = extract_text(&result);
 
-        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
         assert!(parsed.len() <= 2);
     }
 
@@ -290,51 +331,54 @@ mod tests {
     #[tokio::test]
     async fn search_tag_exact() {
         let (_dir, vault) = setup_search_vault().await;
-        let result = handle_search_tag(
+        let result = search_tag(
             &vault,
             SearchTagParams {
                 tag: "inbox".into(),
                 include_nested: Some(false),
-                ..Default::default()
             },
         )
+        .await
         .unwrap();
+        let text = extract_text(&result);
 
-        assert!(result.contains("notes.md"));
-        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert!(text.contains("notes.md"));
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
         assert_eq!(parsed.len(), 1);
     }
 
     #[tokio::test]
     async fn search_tag_include_nested() {
         let (_dir, vault) = setup_search_vault().await;
-        let result = handle_search_tag(
+        let result = search_tag(
             &vault,
             SearchTagParams {
                 tag: "inbox".into(),
                 include_nested: Some(true),
-                ..Default::default()
             },
         )
+        .await
         .unwrap();
+        let text = extract_text(&result);
 
-        assert!(result.contains("notes.md"));
+        assert!(text.contains("notes.md"));
     }
 
     #[tokio::test]
     async fn search_tag_strips_hash_prefix() {
         let (_dir, vault) = setup_search_vault().await;
-        let result = handle_search_tag(
+        let result = search_tag(
             &vault,
             SearchTagParams {
                 tag: "#lang".into(),
                 include_nested: Some(false),
-                ..Default::default()
             },
         )
+        .await
         .unwrap();
+        let text = extract_text(&result);
 
-        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
         assert_eq!(parsed.len(), 2);
     }
 
@@ -343,7 +387,7 @@ mod tests {
     #[tokio::test]
     async fn search_frontmatter_eq() {
         let (_dir, vault) = setup_search_vault().await;
-        let result = handle_search_frontmatter(
+        let result = search_frontmatter(
             &vault,
             SearchFrontmatterParams {
                 field: "status".into(),
@@ -351,17 +395,19 @@ mod tests {
                 operator: FrontmatterOperator::Eq,
             },
         )
+        .await
         .unwrap();
+        let text = extract_text(&result);
 
-        assert!(result.contains("rust.md"));
-        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert!(text.contains("rust.md"));
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
         assert_eq!(parsed.len(), 1);
     }
 
     #[tokio::test]
     async fn search_frontmatter_eq_array_contains() {
         let (_dir, vault) = setup_search_vault().await;
-        let result = handle_search_frontmatter(
+        let result = search_frontmatter(
             &vault,
             SearchFrontmatterParams {
                 field: "tags".into(),
@@ -369,15 +415,17 @@ mod tests {
                 operator: FrontmatterOperator::Eq,
             },
         )
+        .await
         .unwrap();
+        let text = extract_text(&result);
 
-        assert!(result.contains("rust.md"));
+        assert!(text.contains("rust.md"));
     }
 
     #[tokio::test]
     async fn search_frontmatter_contains_substring() {
         let (_dir, vault) = setup_search_vault().await;
-        let result = handle_search_frontmatter(
+        let result = search_frontmatter(
             &vault,
             SearchFrontmatterParams {
                 field: "status".into(),
@@ -385,17 +433,19 @@ mod tests {
                 operator: FrontmatterOperator::Contains,
             },
         )
+        .await
         .unwrap();
+        let text = extract_text(&result);
 
-        assert!(result.contains("python.md"));
-        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert!(text.contains("python.md"));
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
         assert_eq!(parsed.len(), 1);
     }
 
     #[tokio::test]
     async fn search_frontmatter_exists() {
         let (_dir, vault) = setup_search_vault().await;
-        let result = handle_search_frontmatter(
+        let result = search_frontmatter(
             &vault,
             SearchFrontmatterParams {
                 field: "status".into(),
@@ -403,16 +453,18 @@ mod tests {
                 operator: FrontmatterOperator::Exists,
             },
         )
+        .await
         .unwrap();
+        let text = extract_text(&result);
 
-        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
         assert_eq!(parsed.len(), 2); // rust.md + python.md
     }
 
     #[tokio::test]
     async fn search_frontmatter_exists_missing_field() {
         let (_dir, vault) = setup_search_vault().await;
-        let result = handle_search_frontmatter(
+        let result = search_frontmatter(
             &vault,
             SearchFrontmatterParams {
                 field: "nonexistent".into(),
@@ -420,23 +472,26 @@ mod tests {
                 operator: FrontmatterOperator::Exists,
             },
         )
+        .await
         .unwrap();
+        let text = extract_text(&result);
 
-        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
         assert!(parsed.is_empty());
     }
 
     #[tokio::test]
     async fn search_frontmatter_eq_without_value_errors() {
         let (_dir, vault) = setup_search_vault().await;
-        let result = handle_search_frontmatter(
+        let result = search_frontmatter(
             &vault,
             SearchFrontmatterParams {
                 field: "status".into(),
                 value: None,
                 operator: FrontmatterOperator::Eq,
             },
-        );
+        )
+        .await;
 
         assert!(result.is_err());
     }
