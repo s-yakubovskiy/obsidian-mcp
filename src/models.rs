@@ -122,9 +122,10 @@ pub struct PatchRequest {
     pub content: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum NotePeriod {
+    #[default]
     Daily,
     Weekly,
     Monthly,
