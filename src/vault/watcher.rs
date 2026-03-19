@@ -1,1 +1,265 @@
 //! Filesystem watcher: debounced `notify` events that keep the vault index in sync.
+//!
+//! Uses `notify-debouncer-mini` for 500ms debouncing and bridges events into a
+//! spawned tokio task that updates the [`VaultIndex`].
+//!
+//! `notify-debouncer-mini` 0.5 erases event kinds (create/modify/delete/rename all
+//! become `DebouncedEventKind::Any`). We disambiguate by checking the filesystem at
+//! event time: path exists → reindex, path gone → remove.
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+use notify::RecursiveMode;
+use notify_debouncer_mini::{DebounceEventResult, Debouncer, new_debouncer};
+use tokio::runtime::Handle;
+
+use super::index::VaultIndex;
+use crate::error::{VaultError, VaultResult};
+
+const DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(500);
+const EVENT_CHANNEL_CAPACITY: usize = 256;
+
+/// Start watching `vault_root` for filesystem changes.
+///
+/// Returns the [`Debouncer`] handle — the caller **must** keep it alive
+/// (e.g. store it in the `Vault` struct) or watching stops.
+///
+/// Internally spawns a tokio task that receives debounced events, filters
+/// irrelevant paths, and calls the appropriate `VaultIndex` mutation.
+pub fn start_watcher(
+    vault_root: PathBuf,
+    index: Arc<RwLock<VaultIndex>>,
+) -> VaultResult<Debouncer<notify::RecommendedWatcher>> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<DebounceEventResult>(EVENT_CHANNEL_CAPACITY);
+    let rt = Handle::current();
+
+    let mut debouncer = new_debouncer(DEBOUNCE_TIMEOUT, move |result: DebounceEventResult| {
+        let tx = tx.clone();
+        rt.spawn(async move {
+            if let Err(e) = tx.send(result).await {
+                tracing::error!("watcher channel closed: {e}");
+            }
+        });
+    })
+    .map_err(|e| VaultError::Watcher(e.to_string()))?;
+
+    debouncer
+        .watcher()
+        .watch(&vault_root, RecursiveMode::Recursive)
+        .map_err(|e| {
+            VaultError::Watcher(format!("failed to watch {}: {e}", vault_root.display()))
+        })?;
+
+    tracing::info!(path = %vault_root.display(), "filesystem watcher started");
+
+    tokio::spawn(async move {
+        while let Some(result) = rx.recv().await {
+            match result {
+                Ok(events) => {
+                    for event in events {
+                        process_event(&vault_root, &index, &event.path);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("watch error: {e}");
+                }
+            }
+        }
+        tracing::debug!("watcher event loop exited");
+    });
+
+    Ok(debouncer)
+}
+
+/// Decide whether a filesystem event should trigger an index update.
+///
+/// Returns `false` for:
+/// - Paths inside `.obsidian/`
+/// - Non-`.md` files
+fn should_process_path(vault_root: &Path, absolute: &Path) -> bool {
+    let relative = match absolute.strip_prefix(vault_root) {
+        Ok(r) => r,
+        Err(_) => {
+            tracing::trace!(path = %absolute.display(), "event path outside vault root, ignoring");
+            return false;
+        }
+    };
+
+    if is_obsidian_dir(relative) {
+        return false;
+    }
+
+    match absolute.extension().and_then(|e| e.to_str()) {
+        Some("md") => true,
+        Some(ext) => {
+            tracing::trace!(path = %relative.display(), ext, "non-markdown file, ignoring");
+            false
+        }
+        None => {
+            // Deleted files may have lost their extension info if the path no longer
+            // exists. We still accept extensionless paths and let the index handle
+            // the no-op gracefully — `remove_file` on an unknown path is harmless.
+            //
+            // However, directories also lack extensions and we don't want to index
+            // those, so we check if the path *looks* like it had an `.md` extension
+            // by inspecting the string directly.
+            let path_str = absolute.to_string_lossy();
+            if path_str.ends_with(".md") {
+                true
+            } else {
+                tracing::trace!(path = %relative.display(), "no extension, ignoring");
+                false
+            }
+        }
+    }
+}
+
+/// Check if a vault-relative path is inside the `.obsidian/` config directory.
+fn is_obsidian_dir(relative: &Path) -> bool {
+    relative
+        .components()
+        .next()
+        .is_some_and(|c| c.as_os_str() == ".obsidian")
+}
+
+/// Process a single debounced event for a path that passed filtering.
+fn process_event(vault_root: &Path, index: &Arc<RwLock<VaultIndex>>, absolute: &Path) {
+    if !should_process_path(vault_root, absolute) {
+        return;
+    }
+
+    let relative = match absolute.strip_prefix(vault_root) {
+        Ok(r) => r.to_path_buf(),
+        Err(_) => return,
+    };
+
+    if absolute.exists() {
+        tracing::debug!(path = %relative.display(), "reindexing (create/modify)");
+        match index.write() {
+            Ok(mut idx) => {
+                if let Err(e) = idx.reindex_file(vault_root, &relative) {
+                    tracing::warn!(path = %relative.display(), error = %e, "reindex failed");
+                }
+            }
+            Err(e) => {
+                tracing::error!("index lock poisoned: {e}");
+            }
+        }
+    } else {
+        tracing::debug!(path = %relative.display(), "removing (delete)");
+        match index.write() {
+            Ok(mut idx) => idx.remove_file(&relative),
+            Err(e) => {
+                tracing::error!("index lock poisoned: {e}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn vault() -> PathBuf {
+        PathBuf::from("/tmp/test-vault")
+    }
+
+    #[test]
+    fn filters_obsidian_directory() {
+        let root = vault();
+        assert!(!should_process_path(
+            &root,
+            &root.join(".obsidian/plugins/foo.json")
+        ));
+        assert!(!should_process_path(
+            &root,
+            &root.join(".obsidian/workspace.json")
+        ));
+    }
+
+    #[test]
+    fn filters_non_markdown_files() {
+        let root = vault();
+        assert!(!should_process_path(&root, &root.join("image.png")));
+        assert!(!should_process_path(&root, &root.join("data.json")));
+        assert!(!should_process_path(
+            &root,
+            &root.join("subfolder/script.js")
+        ));
+    }
+
+    #[test]
+    fn accepts_markdown_files() {
+        let root = vault();
+        // should_process_path checks extension; the file needn't exist for that check.
+        assert!(should_process_path(&root, &root.join("note.md")));
+        assert!(should_process_path(
+            &root,
+            &root.join("subfolder/deep/note.md")
+        ));
+    }
+
+    #[test]
+    fn filters_paths_outside_vault() {
+        let root = vault();
+        assert!(!should_process_path(
+            &root,
+            Path::new("/other/place/note.md")
+        ));
+    }
+
+    #[test]
+    fn obsidian_dir_detection() {
+        assert!(is_obsidian_dir(Path::new(".obsidian/plugins/foo.json")));
+        assert!(is_obsidian_dir(Path::new(".obsidian")));
+        assert!(!is_obsidian_dir(Path::new("notes/.obsidian/foo")));
+        assert!(!is_obsidian_dir(Path::new("daily/2024-01-01.md")));
+    }
+
+    #[tokio::test]
+    async fn watcher_starts_and_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault_root = dir.path().to_path_buf();
+        let index = Arc::new(RwLock::new(VaultIndex::empty()));
+
+        let debouncer = start_watcher(vault_root, index);
+        assert!(debouncer.is_ok(), "watcher should start without error");
+
+        drop(debouncer.unwrap());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    async fn watcher_survives_mixed_file_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault_root = dir.path().to_path_buf();
+        let index = Arc::new(RwLock::new(VaultIndex::empty()));
+
+        let _debouncer = start_watcher(vault_root.clone(), index).unwrap();
+
+        // Create files the watcher should ignore.
+        std::fs::write(vault_root.join("image.png"), b"fake png").unwrap();
+        std::fs::create_dir_all(vault_root.join(".obsidian")).unwrap();
+        std::fs::write(vault_root.join(".obsidian/workspace.json"), b"{}").unwrap();
+
+        // Create a markdown file the watcher should process.
+        std::fs::write(vault_root.join("note.md"), "# Hello\n").unwrap();
+
+        // Modify it.
+        std::fs::write(vault_root.join("note.md"), "# Hello\nUpdated.\n").unwrap();
+
+        // Wait for debounce timeout + processing headroom.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // Delete it.
+        std::fs::remove_file(vault_root.join("note.md")).unwrap();
+
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+
+        // The watcher should not have panicked. VaultIndex stubs are no-ops,
+        // so we can't assert index state here — Task 3A integration tests will.
+    }
+}

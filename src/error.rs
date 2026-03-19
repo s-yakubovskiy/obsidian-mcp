@@ -37,6 +37,12 @@ pub enum VaultError {
     #[error("Invalid vault path: {0} is outside vault root")]
     OutsideVault(PathBuf),
 
+    #[error("Invalid regex pattern '{pattern}': {source}")]
+    InvalidRegex {
+        pattern: String,
+        source: regex::Error,
+    },
+
     #[error("Watcher error: {0}")]
     Watcher(String),
 
@@ -55,7 +61,8 @@ impl From<VaultError> for rmcp::ErrorData {
             VaultError::InvalidPath(_)
             | VaultError::OutsideVault(_)
             | VaultError::AlreadyExists(_)
-            | VaultError::PatchTargetNotFound { .. } => ErrorCode::INVALID_PARAMS,
+            | VaultError::PatchTargetNotFound { .. }
+            | VaultError::InvalidRegex { .. } => ErrorCode::INVALID_PARAMS,
             VaultError::FrontmatterParse { .. } => ErrorCode::PARSE_ERROR,
             VaultError::Io(_) | VaultError::Watcher(_) | VaultError::Other(_) => {
                 ErrorCode::INTERNAL_ERROR
