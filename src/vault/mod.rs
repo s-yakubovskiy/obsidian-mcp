@@ -342,6 +342,7 @@ impl Vault {
         &self,
         period: &NotePeriod,
         date: Option<NaiveDate>,
+        content_override: Option<&str>,
     ) -> VaultResult<PathBuf> {
         let config = periodic::read_periodic_config(&self.inner.root, period)?;
         let date = date.unwrap_or_else(|| Local::now().date_naive());
@@ -351,15 +352,24 @@ impl Vault {
             return Err(VaultError::AlreadyExists(path));
         }
 
-        let content = match &config.template {
-            Some(tmpl) if !tmpl.is_empty() => {
-                let title = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or_default();
-                periodic::expand_template(&self.inner.root, Path::new(tmpl), &date, title)?
+        let content = if let Some(custom) = content_override {
+            custom.to_owned()
+        } else {
+            match &config.template {
+                Some(tmpl) if !tmpl.is_empty() => {
+                    let title = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or_default();
+                    match periodic::expand_template(&self.inner.root, Path::new(tmpl), &date, title)
+                    {
+                        Ok(c) => c,
+                        Err(VaultError::NoteNotFound(_)) => String::new(),
+                        Err(e) => return Err(e),
+                    }
+                }
+                _ => String::new(),
             }
-            _ => String::new(),
         };
 
         fs::write_file(&self.inner.root, &path, &content)?;

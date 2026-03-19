@@ -479,7 +479,7 @@ mod vault_periodic {
         let (_tmp, vault) = copy_fixture_to_temp().await;
         let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
         let path = vault
-            .create_periodic_note(&NotePeriod::Daily, Some(date))
+            .create_periodic_note(&NotePeriod::Daily, Some(date), None)
             .unwrap();
         assert!(path.to_string_lossy().contains("2026-01-15"));
         let content = vault.read_note(&path).unwrap();

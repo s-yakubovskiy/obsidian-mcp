@@ -58,11 +58,7 @@ pub async fn periodic_create(
     params: PeriodicCreateParams,
 ) -> Result<String, rmcp::ErrorData> {
     let date = params.date.map(|s| parse_date(&s)).transpose()?;
-    let path = vault.create_periodic_note(&params.period, date)?;
-
-    if let Some(content) = params.content {
-        vault.write_note(&path, &content)?;
-    }
+    let path = vault.create_periodic_note(&params.period, date, params.content.as_deref())?;
 
     Ok(format!("Created: {}", path.display()))
 }

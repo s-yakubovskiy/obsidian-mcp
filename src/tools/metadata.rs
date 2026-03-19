@@ -97,9 +97,10 @@ pub async fn frontmatter_get(
     let path = Path::new(&params.path);
     let fm = vault.get_frontmatter(path)?;
 
-    Ok(CallToolResult::structured(
-        fm.unwrap_or(serde_json::Value::Null),
-    ))
+    match fm {
+        Some(value) => Ok(CallToolResult::structured(value)),
+        None => Ok(CallToolResult::success(vec![Content::text("null")])),
+    }
 }
 
 // ── frontmatter_set ────────────────────────────────────────────────────
@@ -299,7 +300,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result.structured_content.unwrap(), serde_json::Value::Null);
+        assert!(result.structured_content.is_none());
+        let text = result.content[0].as_text().expect("expected text content");
+        assert_eq!(text.text, "null");
 
         frontmatter_set(
             &vault,
