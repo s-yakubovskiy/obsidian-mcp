@@ -176,7 +176,10 @@ pub fn rebuild_content(frontmatter: Option<&serde_json::Value>, body: &str) -> S
         Some(fm) if fm.as_object().is_some_and(|m| !m.is_empty()) => {
             match serde_yaml::to_string(fm) {
                 Ok(yaml) => format!("---\n{yaml}---\n{body}"),
-                Err(_) => body.to_string(),
+                Err(e) => {
+                    tracing::warn!("Failed to serialize frontmatter, dropping it: {e}");
+                    body.to_string()
+                }
             }
         }
         _ => body.to_string(),

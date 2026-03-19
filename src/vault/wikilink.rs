@@ -128,10 +128,11 @@ impl LinkResolver {
     }
 }
 
-/// Strip `.md` suffix (if present) and lowercase.
-/// Shared by all key-derivation and target-normalization helpers.
+/// Lowercase then strip `.md` suffix (if present).
+/// Lowercasing first ensures case-insensitive `.md`/`.MD`/`.Md` stripping.
 fn lowercase_without_md(s: &str) -> String {
-    s.strip_suffix(".md").unwrap_or(s).to_lowercase()
+    let lower = s.to_lowercase();
+    lower.strip_suffix(".md").map(String::from).unwrap_or(lower)
 }
 
 #[cfg(test)]

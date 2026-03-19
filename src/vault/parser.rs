@@ -257,10 +257,18 @@ pub fn extract_wikilinks(content: &str) -> Vec<WikiLink> {
 }
 
 /// Extract all block reference IDs (`^blockid` at end of line or standalone).
+/// Skips block refs inside code blocks and inline code spans.
 pub fn extract_block_refs(content: &str) -> Vec<String> {
+    let exclusions = code_block_ranges(content);
     BLOCK_REF_RE
         .captures_iter(content)
-        .filter_map(|cap| Some(cap.get(1)?.as_str().to_string()))
+        .filter_map(|cap| {
+            let m = cap.get(1)?;
+            if is_in_code_block(m.start(), &exclusions) {
+                return None;
+            }
+            Some(m.as_str().to_string())
+        })
         .collect()
 }
 
@@ -301,7 +309,9 @@ pub fn find_heading_range(
 
     for segment in &segments {
         let idx = headings.iter().position(|h| {
-            h.offset >= search_start && h.offset < search_end && h.text == *segment
+            h.offset >= search_start
+                && h.offset < search_end
+                && h.text.eq_ignore_ascii_case(segment)
         })?;
 
         let level = headings[idx].level;
@@ -734,5 +744,22 @@ More text ^ref2
         assert!(extract_headings(content).is_empty());
         assert!(extract_wikilinks(content).is_empty());
         assert!(extract_inline_tags(content).is_empty());
+        assert!(extract_block_refs(content).is_empty());
+    }
+
+    #[test]
+    fn block_refs_skip_code_block() {
+        let content = "Real text ^real-ref\n\n```\n^fake-ref\n```\n\nAnother ^also-real\n";
+        let refs = extract_block_refs(content);
+        assert_eq!(refs, vec!["real-ref", "also-real"]);
+    }
+
+    #[test]
+    fn heading_range_case_insensitive() {
+        let content = "# My Title\n\nContent here.\n\n# Other\n";
+        let range = find_heading_range(content, "my title", "::");
+        assert!(range.is_some());
+        let (start, _) = range.unwrap();
+        assert_eq!(start, 0);
     }
 }
