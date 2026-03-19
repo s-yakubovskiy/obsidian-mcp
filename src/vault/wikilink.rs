@@ -110,32 +110,28 @@ impl LinkResolver {
     /// Normalize a wikilink target for lookup:
     /// strip trailing `.md`, normalize path separators, lowercase.
     fn normalize_target(target: &str) -> String {
-        let t = target.replace('\\', "/");
-        let stripped = t.strip_suffix(".md").unwrap_or(&t);
-        stripped.to_lowercase()
+        lowercase_without_md(&target.replace('\\', "/"))
     }
 
     /// Compute the path-based lookup key for a vault-relative path.
     /// `.md` files: path without `.md`, lowercased.
     /// Other files: full path, lowercased.
     fn path_key(path: &Path) -> String {
-        let s = path.to_string_lossy().replace('\\', "/");
-        match s.strip_suffix(".md") {
-            Some(without_ext) => without_ext.to_lowercase(),
-            None => s.to_lowercase(),
-        }
+        lowercase_without_md(&path.to_string_lossy().replace('\\', "/"))
     }
 
     /// Compute the stem-based lookup key for a vault-relative path.
     /// `.md` files: filename without `.md`, lowercased.
     /// Other files: full filename with extension, lowercased.
     fn stem_key(path: &Path) -> String {
-        let name = path.file_name().unwrap_or_default().to_string_lossy();
-        match name.strip_suffix(".md") {
-            Some(without_ext) => without_ext.to_lowercase(),
-            None => name.to_lowercase(),
-        }
+        lowercase_without_md(&path.file_name().unwrap_or_default().to_string_lossy())
     }
+}
+
+/// Strip `.md` suffix (if present) and lowercase.
+/// Shared by all key-derivation and target-normalization helpers.
+fn lowercase_without_md(s: &str) -> String {
+    s.strip_suffix(".md").unwrap_or(s).to_lowercase()
 }
 
 #[cfg(test)]
