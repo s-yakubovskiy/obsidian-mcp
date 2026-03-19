@@ -1,15 +1,9 @@
-mod config;
-mod error;
-mod models;
-mod tools;
-mod vault;
-
 use rmcp::ServiceExt;
 use tracing_subscriber::EnvFilter;
 
-use crate::config::Config;
-use crate::tools::ObsidianMcp;
-use crate::vault::Vault;
+use obsidian_mcp::config::Config;
+use obsidian_mcp::tools::ObsidianMcp;
+use obsidian_mcp::vault::Vault;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
