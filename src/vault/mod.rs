@@ -113,6 +113,41 @@ impl Vault {
         Ok(())
     }
 
+    /// Create a new note. Returns `AlreadyExists` if the path is occupied.
+    /// Optionally prepends YAML frontmatter before the body content.
+    pub fn create_note(
+        &self,
+        path: &Path,
+        content: &str,
+        frontmatter: Option<&serde_json::Value>,
+    ) -> VaultResult<()> {
+        if fs::file_exists(&self.inner.root, path) {
+            return Err(VaultError::AlreadyExists(path.to_path_buf()));
+        }
+        let full_content = frontmatter::rebuild_content(frontmatter, content);
+        fs::write_file(&self.inner.root, path, &full_content)?;
+        self.reindex(path)?;
+        Ok(())
+    }
+
+    /// Prepend content after frontmatter (or at the start if none exists).
+    pub fn prepend_note(&self, path: &Path, content: &str) -> VaultResult<()> {
+        let existing = fs::read_file(&self.inner.root, path)?;
+        let new_content = match frontmatter::extract_raw_frontmatter(&existing) {
+            Some((_, body_start)) => {
+                let mut result = String::with_capacity(existing.len() + content.len());
+                result.push_str(&existing[..body_start]);
+                result.push_str(content);
+                result.push_str(&existing[body_start..]);
+                result
+            }
+            None => format!("{content}{existing}"),
+        };
+        fs::write_file(&self.inner.root, path, &new_content)?;
+        self.reindex(path)?;
+        Ok(())
+    }
+
     pub fn delete_note(&self, path: &Path) -> VaultResult<()> {
         fs::delete_file(&self.inner.root, path)?;
         self.write_index().remove_file(path);
@@ -201,6 +236,15 @@ impl Vault {
             .collect())
     }
 
+    pub fn search_by_tag_prefix(&self, tag: &str) -> VaultResult<Vec<NoteMetadata>> {
+        Ok(self
+            .read_index()
+            .notes_with_tag_prefix(tag)
+            .into_iter()
+            .cloned()
+            .collect())
+    }
+
     pub fn search_frontmatter(
         &self,
         field: &str,
@@ -209,6 +253,28 @@ impl Vault {
         Ok(self
             .read_index()
             .search_frontmatter(field, value)
+            .into_iter()
+            .cloned()
+            .collect())
+    }
+
+    pub fn search_frontmatter_exists(&self, field: &str) -> VaultResult<Vec<NoteMetadata>> {
+        Ok(self
+            .read_index()
+            .search_frontmatter_exists(field)
+            .into_iter()
+            .cloned()
+            .collect())
+    }
+
+    pub fn search_frontmatter_contains(
+        &self,
+        field: &str,
+        value: &serde_json::Value,
+    ) -> VaultResult<Vec<NoteMetadata>> {
+        Ok(self
+            .read_index()
+            .search_frontmatter_contains(field, value)
             .into_iter()
             .cloned()
             .collect())
@@ -236,6 +302,10 @@ impl Vault {
         Ok(self.read_index().broken_links())
     }
 
+    pub fn resolve_link(&self, target: &str) -> Option<PathBuf> {
+        self.read_index().resolve_link(target)
+    }
+
     pub fn orphan_notes(&self) -> VaultResult<Vec<NoteMetadata>> {
         Ok(self
             .read_index()
@@ -247,6 +317,12 @@ impl Vault {
 
     pub fn vault_stats(&self) -> VaultResult<VaultStats> {
         Ok(self.read_index().stats().clone())
+    }
+
+    /// Validate that a relative path doesn't escape the vault root.
+    pub fn validate_path(&self, path: &Path) -> VaultResult<()> {
+        fs::resolve_path(&self.inner.root, path)?;
+        Ok(())
     }
 
     // ── periodic delegation ────────────────────────────────────────────
@@ -579,6 +655,83 @@ mod tests {
 
         let stats = vault.vault_stats().unwrap();
         assert_eq!(stats.total_notes, 2);
+    }
+
+    #[tokio::test]
+    async fn vault_create_note_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+
+        vault
+            .create_note(Path::new("new.md"), "# New\n", None)
+            .unwrap();
+        let content = vault.read_note(Path::new("new.md")).unwrap();
+        assert_eq!(content, "# New\n");
+    }
+
+    #[tokio::test]
+    async fn vault_create_note_with_frontmatter() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+
+        let fm = serde_json::json!({"tags": ["test"], "draft": true});
+        vault
+            .create_note(Path::new("fm.md"), "Body\n", Some(&fm))
+            .unwrap();
+        let content = vault.read_note(Path::new("fm.md")).unwrap();
+        assert!(content.starts_with("---\n"));
+        assert!(content.contains("Body\n"));
+    }
+
+    #[tokio::test]
+    async fn vault_create_note_fails_if_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+
+        vault.create_note(Path::new("dup.md"), "", None).unwrap();
+        let err = vault
+            .create_note(Path::new("dup.md"), "new", None)
+            .unwrap_err();
+        assert!(matches!(err, VaultError::AlreadyExists(_)));
+    }
+
+    #[tokio::test]
+    async fn vault_prepend_after_frontmatter() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+
+        vault
+            .write_note(Path::new("pre.md"), "---\ntags: [a]\n---\nExisting body\n")
+            .unwrap();
+        vault
+            .prepend_note(Path::new("pre.md"), "Prepended\n")
+            .unwrap();
+        let content = vault.read_note(Path::new("pre.md")).unwrap();
+
+        assert!(content.starts_with("---\n"));
+        let prepended_pos = content.find("Prepended\n").unwrap();
+        let existing_pos = content.find("Existing body\n").unwrap();
+        assert!(prepended_pos < existing_pos);
+    }
+
+    #[tokio::test]
+    async fn vault_prepend_no_frontmatter() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+
+        vault
+            .write_note(Path::new("nofm.md"), "Existing\n")
+            .unwrap();
+        vault
+            .prepend_note(Path::new("nofm.md"), "Prepended\n")
+            .unwrap();
+        let content = vault.read_note(Path::new("nofm.md")).unwrap();
+        assert_eq!(content, "Prepended\nExisting\n");
     }
 
     #[test]

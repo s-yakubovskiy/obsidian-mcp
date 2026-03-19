@@ -202,6 +202,25 @@ impl VaultIndex {
             .unwrap_or_default()
     }
 
+    /// Match a tag and all its children (e.g. `inbox` matches `inbox/read`, `inbox/todo`).
+    pub fn notes_with_tag_prefix(&self, prefix: &str) -> Vec<&NoteMetadata> {
+        let nested_prefix = format!("{prefix}/");
+        let mut seen = HashSet::new();
+        let mut results = Vec::new();
+        for (tag, paths) in &self.tags {
+            if tag == prefix || tag.starts_with(&nested_prefix) {
+                for path in paths {
+                    if seen.insert(path) {
+                        if let Some(note) = self.notes.get(path) {
+                            results.push(note);
+                        }
+                    }
+                }
+            }
+        }
+        results
+    }
+
     pub fn backlinks_to(&self, path: &Path) -> Vec<&NoteMetadata> {
         self.backlinks
             .get(path)
@@ -229,6 +248,10 @@ impl VaultIndex {
             }
         }
         result
+    }
+
+    pub fn resolve_link(&self, target: &str) -> Option<PathBuf> {
+        self.link_resolver.resolve(target)
     }
 
     pub fn orphan_notes(&self) -> Vec<&NoteMetadata> {
@@ -290,6 +313,35 @@ impl VaultIndex {
                 note.frontmatter
                     .as_ref()
                     .is_some_and(|fm| frontmatter_field_matches(fm, field, value))
+            })
+            .collect()
+    }
+
+    /// Find notes where a frontmatter field exists, regardless of value.
+    pub fn search_frontmatter_exists(&self, field: &str) -> Vec<&NoteMetadata> {
+        self.notes
+            .values()
+            .filter(|note| {
+                note.frontmatter
+                    .as_ref()
+                    .is_some_and(|fm| fm.get(field).is_some())
+            })
+            .collect()
+    }
+
+    /// Search notes by frontmatter with "contains" semantics:
+    /// arrays → element membership, strings → substring match, otherwise exact.
+    pub fn search_frontmatter_contains(
+        &self,
+        field: &str,
+        value: &serde_json::Value,
+    ) -> Vec<&NoteMetadata> {
+        self.notes
+            .values()
+            .filter(|note| {
+                note.frontmatter
+                    .as_ref()
+                    .is_some_and(|fm| frontmatter_field_contains(fm, field, value))
             })
             .collect()
     }
@@ -468,6 +520,28 @@ fn frontmatter_field_matches(
     }
 
     false
+}
+
+fn frontmatter_field_contains(
+    fm: &serde_json::Value,
+    field: &str,
+    value: &serde_json::Value,
+) -> bool {
+    let Some(field_val) = fm.get(field) else {
+        return false;
+    };
+
+    match field_val {
+        serde_json::Value::Array(arr) => arr.contains(value),
+        serde_json::Value::String(haystack) => {
+            if let serde_json::Value::String(needle) = value {
+                haystack.contains(needle.as_str())
+            } else {
+                false
+            }
+        }
+        _ => field_val == value,
+    }
 }
 
 // ── tests ───────────────────────────────────────────────────────────
@@ -931,5 +1005,87 @@ mod tests {
                 .search_frontmatter("no_such_field", &serde_json::json!("value"))
                 .is_empty()
         );
+    }
+
+    // ── tag prefix tests ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn notes_with_tag_prefix_includes_nested() {
+        let dir = TempDir::new().unwrap();
+        stdfs::write(dir.path().join("a.md"), "# A\n\n#inbox\n").unwrap();
+        stdfs::write(dir.path().join("b.md"), "# B\n\n#inbox/read\n").unwrap();
+        stdfs::write(dir.path().join("c.md"), "# C\n\n#inbox/todo\n").unwrap();
+        stdfs::write(dir.path().join("d.md"), "---\ntags: [other]\n---\n# D\n").unwrap();
+
+        let index = VaultIndex::build(dir.path()).await.unwrap();
+        let results = index.notes_with_tag_prefix("inbox");
+        assert_eq!(results.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn notes_with_tag_prefix_no_false_prefix_match() {
+        let dir = TempDir::new().unwrap();
+        stdfs::write(dir.path().join("a.md"), "# A\n\n#inbox\n").unwrap();
+        stdfs::write(dir.path().join("b.md"), "# B\n\n#inboxes\n").unwrap();
+
+        let index = VaultIndex::build(dir.path()).await.unwrap();
+        let results = index.notes_with_tag_prefix("inbox");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, PathBuf::from("a.md"));
+    }
+
+    #[tokio::test]
+    async fn notes_with_tag_prefix_deduplicates() {
+        let dir = TempDir::new().unwrap();
+        stdfs::write(dir.path().join("a.md"), "# A\n\n#inbox #inbox/read\n").unwrap();
+
+        let index = VaultIndex::build(dir.path()).await.unwrap();
+        let results = index.notes_with_tag_prefix("inbox");
+        assert_eq!(results.len(), 1);
+    }
+
+    // ── frontmatter exists / contains tests ─────────────────────────
+
+    #[tokio::test]
+    async fn search_frontmatter_exists_finds_field() {
+        let vault = setup_vault();
+        let index = VaultIndex::build(vault.path()).await.unwrap();
+
+        let results = index.search_frontmatter_exists("tags");
+        assert_eq!(results.len(), 2); // daily.md + notes/alpha.md
+    }
+
+    #[tokio::test]
+    async fn search_frontmatter_exists_missing_field_empty() {
+        let vault = setup_vault();
+        let index = VaultIndex::build(vault.path()).await.unwrap();
+
+        assert!(index.search_frontmatter_exists("nonexistent").is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_frontmatter_contains_string_substring() {
+        let dir = TempDir::new().unwrap();
+        stdfs::write(
+            dir.path().join("a.md"),
+            "---\nstatus: in progress\n---\n# A\n",
+        )
+        .unwrap();
+        stdfs::write(dir.path().join("b.md"), "---\nstatus: done\n---\n# B\n").unwrap();
+
+        let index = VaultIndex::build(dir.path()).await.unwrap();
+        let results = index.search_frontmatter_contains("status", &serde_json::json!("progress"));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, PathBuf::from("a.md"));
+    }
+
+    #[tokio::test]
+    async fn search_frontmatter_contains_array_element() {
+        let vault = setup_vault();
+        let index = VaultIndex::build(vault.path()).await.unwrap();
+
+        let results = index.search_frontmatter_contains("tags", &serde_json::json!("rust"));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, PathBuf::from("notes/alpha.md"));
     }
 }
