@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 
 const DEFAULT_EMBEDDINGS_MODEL: &str = "BAAI/bge-small-en-v1.5";
+const DEFAULT_HYBRID_ALPHA: f32 = 0.25;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -16,6 +17,9 @@ pub struct Config {
     pub embeddings: bool,
     /// HuggingFace model name for embeddings (`OBSIDIAN_EMBEDDINGS_MODEL`).
     pub embeddings_model: String,
+    /// Hybrid search alpha: `alpha * BM25 + (1-alpha) * semantic` (`OBSIDIAN_HYBRID_ALPHA`, default `0.25`).
+    /// Clamped to `[0.0, 1.0]`. Lower values give more weight to semantic similarity.
+    pub hybrid_alpha: f32,
 }
 
 impl Config {
@@ -48,6 +52,12 @@ impl Config {
         let embeddings_model = std::env::var("OBSIDIAN_EMBEDDINGS_MODEL")
             .unwrap_or_else(|_| DEFAULT_EMBEDDINGS_MODEL.into());
 
+        let hybrid_alpha = std::env::var("OBSIDIAN_HYBRID_ALPHA")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(DEFAULT_HYBRID_ALPHA)
+            .clamp(0.0, 1.0);
+
         Ok(Self {
             vault_path,
             watch,
@@ -55,6 +65,7 @@ impl Config {
             tantivy,
             embeddings,
             embeddings_model,
+            hybrid_alpha,
         })
     }
 }

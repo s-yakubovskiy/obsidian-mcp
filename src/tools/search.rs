@@ -179,7 +179,9 @@ pub async fn search_frontmatter(
 #[cfg(feature = "embeddings")]
 const DEFAULT_PREFETCH_COUNT: usize = 50;
 #[cfg(feature = "embeddings")]
-const DEFAULT_ALPHA: f32 = 0.4;
+const SNIPPET_CONTEXT_LEN: usize = 100;
+#[cfg(feature = "embeddings")]
+const SNIPPET_FALLBACK_CHARS: usize = 200;
 
 #[derive(Deserialize, JsonSchema, Default)]
 pub struct SearchSemanticParams {
@@ -198,6 +200,11 @@ pub struct SearchSemanticParams {
     /// Tantivy and embeddings to be enabled. Default: false.
     #[serde(default)]
     pub lexical_prefetch: Option<bool>,
+    /// Blending weight for hybrid re-ranking: `alpha * BM25 + (1-alpha) * semantic`.
+    /// Only used when `lexical_prefetch` is true. Lower values favor semantic similarity.
+    /// Overrides the `OBSIDIAN_HYBRID_ALPHA` env var for this query. Range: 0.0–1.0, default: 0.25.
+    #[serde(default)]
+    pub alpha: Option<f32>,
 }
 
 #[cfg(feature = "embeddings")]
@@ -208,6 +215,8 @@ struct SemanticSearchResult {
     score: f32,
     tags: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    snippet: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
 }
 
@@ -215,6 +224,7 @@ struct SemanticSearchResult {
 pub async fn search_semantic(
     vault: &Vault,
     params: SearchSemanticParams,
+    default_alpha: f32,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     if !vault.has_embeddings() {
         return Err(rmcp::ErrorData::new(
@@ -227,11 +237,28 @@ pub async fn search_semantic(
     let top_k = params.top_k.unwrap_or(10);
     let include_content = params.include_content.unwrap_or(false);
     let lexical_prefetch = params.lexical_prefetch.unwrap_or(false);
+    let alpha = params.alpha.unwrap_or(default_alpha).clamp(0.0, 1.0);
 
     let hits = if lexical_prefetch {
-        vault.search_hybrid(&params.query, top_k, DEFAULT_PREFETCH_COUNT, DEFAULT_ALPHA)?
+        vault.search_hybrid(&params.query, top_k, DEFAULT_PREFETCH_COUNT, alpha)?
     } else {
         vault.search_semantic(&params.query, top_k)?
+    };
+
+    let word_re = if !include_content {
+        let pattern: String = params
+            .query
+            .split_whitespace()
+            .map(regex::escape)
+            .collect::<Vec<_>>()
+            .join("|");
+        if pattern.is_empty() {
+            None
+        } else {
+            regex::Regex::new(&format!("(?i){pattern}")).ok()
+        }
+    } else {
+        None
     };
 
     let mut results = Vec::with_capacity(hits.len());
@@ -239,16 +266,33 @@ pub async fn search_semantic(
         let meta = vault.get_note_metadata(&path).ok();
         let title = meta.as_ref().map(|m| m.title.clone()).unwrap_or_default();
         let tags = meta.as_ref().map(|m| m.tags.clone()).unwrap_or_default();
-        let content = if include_content {
-            vault.read_note(&path).ok()
+
+        let (content, snippet) = if include_content {
+            (vault.read_note(&path).ok(), None)
         } else {
-            None
+            let snip = vault.read_note(&path).ok().map(|text| {
+                if let Some(ref re) = word_re {
+                    if let Some(m) = re.find(&text) {
+                        let (ctx, _, _, _) = crate::vault::index::extract_match_context(
+                            &text,
+                            m.start(),
+                            m.end(),
+                            SNIPPET_CONTEXT_LEN,
+                        );
+                        return ctx;
+                    }
+                }
+                body_preview(&text, SNIPPET_FALLBACK_CHARS)
+            });
+            (None, snip)
         };
+
         results.push(SemanticSearchResult {
             path,
             title,
             score,
             tags,
+            snippet,
             content,
         });
     }
@@ -258,10 +302,28 @@ pub async fn search_semantic(
     Ok(CallToolResult::success(vec![Content::text(json)]))
 }
 
+#[cfg(feature = "embeddings")]
+fn body_preview(content: &str, max_chars: usize) -> String {
+    let start = if content.starts_with("---") {
+        content[3..]
+            .find("\n---")
+            .map(|i| {
+                let end = i + 7; // skip initial "---" (3) + "\n---" (4)
+                content[end..].find('\n').map_or(end, |nl| end + nl + 1)
+            })
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let body = content[start..].trim_start();
+    body.chars().take(max_chars).collect()
+}
+
 #[cfg(not(feature = "embeddings"))]
 pub async fn search_semantic(
     _vault: &Vault,
     _params: SearchSemanticParams,
+    _default_alpha: f32,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     Err(rmcp::ErrorData::new(
         ErrorCode::INVALID_REQUEST,
@@ -287,6 +349,7 @@ mod tests {
             tantivy: false,
             embeddings: false,
             embeddings_model: String::new(),
+            hybrid_alpha: 0.25,
         }
     }
 
@@ -626,6 +689,7 @@ mod tests {
             tantivy: true,
             embeddings: false,
             embeddings_model: String::new(),
+            hybrid_alpha: 0.25,
         }
     }
 
@@ -763,5 +827,66 @@ mod tests {
         let matches = parsed[0]["matches"].as_array().unwrap();
         assert!(!matches.is_empty(), "should have context matches");
         assert!(matches[0]["context"].as_str().unwrap().contains("pasta"));
+    }
+
+    // ── SearchSemanticParams ────────────────────────────────────────
+
+    #[test]
+    fn semantic_params_defaults() {
+        let params: SearchSemanticParams = serde_json::from_str(r#"{"query": "test"}"#).unwrap();
+        assert_eq!(params.query, "test");
+        assert!(params.alpha.is_none());
+        assert!(params.lexical_prefetch.is_none());
+        assert!(params.top_k.is_none());
+    }
+
+    #[test]
+    fn semantic_params_with_alpha() {
+        let params: SearchSemanticParams =
+            serde_json::from_str(r#"{"query": "q", "alpha": 0.7, "lexical_prefetch": true}"#)
+                .unwrap();
+        assert!((params.alpha.unwrap() - 0.7).abs() < f32::EPSILON);
+        assert_eq!(params.lexical_prefetch, Some(true));
+    }
+
+    // ── body_preview ────────────────────────────────────────────────
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn body_preview_strips_frontmatter() {
+        let content = "---\ntags: [a]\n---\nHello world";
+        let preview = super::body_preview(content, 100);
+        assert_eq!(preview, "Hello world");
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn body_preview_no_frontmatter() {
+        let content = "# Title\nSome body text";
+        let preview = super::body_preview(content, 100);
+        assert_eq!(preview, "# Title\nSome body text");
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn body_preview_truncates() {
+        let content = "---\nk: v\n---\nABCDEFGHIJ";
+        let preview = super::body_preview(content, 5);
+        assert_eq!(preview, "ABCDE");
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn body_preview_empty_content() {
+        let preview = super::body_preview("", 100);
+        assert_eq!(preview, "");
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn body_preview_unclosed_frontmatter() {
+        let content = "---\ntags: [a]\nNo closing delimiter here";
+        let preview = super::body_preview(content, 200);
+        assert!(preview.contains("tags:"));
     }
 }

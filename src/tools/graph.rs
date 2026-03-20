@@ -211,6 +211,7 @@ mod tests {
             tantivy: false,
             embeddings: false,
             embeddings_model: String::new(),
+            hybrid_alpha: 0.25,
         }
     }
 

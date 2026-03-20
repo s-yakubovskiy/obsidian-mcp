@@ -17,15 +17,17 @@ use crate::vault::Vault;
 
 pub struct ObsidianMcp {
     vault: Vault,
+    hybrid_alpha: f32,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl ObsidianMcp {
-    pub fn new(vault: Vault) -> Self {
+    pub fn new(vault: Vault, hybrid_alpha: f32) -> Self {
         Self {
             tool_router: Self::tool_router(),
             vault,
+            hybrid_alpha,
         }
     }
 
@@ -197,7 +199,7 @@ impl ObsidianMcp {
         &self,
         Parameters(params): Parameters<search::SearchSemanticParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        search::search_semantic(&self.vault, params).await
+        search::search_semantic(&self.vault, params, self.hybrid_alpha).await
     }
 
     // ── Metadata ────────────────────────────────────────────────────

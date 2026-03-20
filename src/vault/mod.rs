@@ -843,6 +843,7 @@ mod tests {
             tantivy: false,
             embeddings: false,
             embeddings_model: String::new(),
+            hybrid_alpha: 0.25,
         }
     }
 
@@ -878,6 +879,7 @@ mod tests {
             tantivy: false,
             embeddings: false,
             embeddings_model: String::new(),
+            hybrid_alpha: 0.25,
         };
 
         let result = Vault::open(&config).await;
@@ -1190,6 +1192,7 @@ mod tests {
             tantivy: true,
             embeddings: false,
             embeddings_model: String::new(),
+            hybrid_alpha: 0.25,
         }
     }
 

@@ -20,6 +20,7 @@ fn fixture_config() -> Config {
         tantivy: false,
         embeddings: false,
         embeddings_model: String::new(),
+        hybrid_alpha: 0.25,
     }
 }
 
@@ -40,6 +41,7 @@ async fn copy_fixture_to_temp() -> (tempfile::TempDir, Vault) {
         tantivy: false,
         embeddings: false,
         embeddings_model: String::new(),
+        hybrid_alpha: 0.25,
     };
     let vault = Vault::open(&config)
         .await
@@ -315,6 +317,7 @@ mod vault_tantivy_search {
             tantivy: true,
             embeddings: false,
             embeddings_model: String::new(),
+            hybrid_alpha: 0.25,
         };
         let vault = Vault::open(&config)
             .await
@@ -636,6 +639,7 @@ mod vault_semantic_search {
             tantivy: false,
             embeddings: true,
             embeddings_model: "BAAI/bge-small-en-v1.5".into(),
+            hybrid_alpha: 0.25,
         }
     }
 

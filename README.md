@@ -60,6 +60,7 @@ Extract and place the binary somewhere in your `$PATH`.
 | `OBSIDIAN_TANTIVY` | No | `true` | Enable Tantivy BM25 full-text index |
 | `OBSIDIAN_EMBEDDINGS` | No | `false` | Enable semantic embedding search (requires `embeddings` feature) |
 | `OBSIDIAN_EMBEDDINGS_MODEL` | No | `BAAI/bge-small-en-v1.5` | HuggingFace model for embeddings |
+| `OBSIDIAN_HYBRID_ALPHA` | No | `0.25` | Hybrid search blend: `alpha × BM25 + (1−alpha) × semantic` (0.0–1.0) |
 
 \* Can also be passed as the first CLI argument: `obsidian-mcp /path/to/vault`
 

@@ -219,6 +219,7 @@ npx @modelcontextprotocol/inspector cargo run
 | `OBSIDIAN_TANTIVY` | No | `true` | Enable Tantivy BM25 full-text index |
 | `OBSIDIAN_EMBEDDINGS` | No | `false` | Enable semantic embedding search (requires `embeddings` feature) |
 | `OBSIDIAN_EMBEDDINGS_MODEL` | No | `BAAI/bge-small-en-v1.5` | HuggingFace model name for embeddings |
+| `OBSIDIAN_HYBRID_ALPHA` | No | `0.25` | Hybrid search blending weight: `alpha * BM25 + (1-alpha) * semantic`. Clamped to [0.0, 1.0]. |
 
 ## Known Gotchas & Decisions
 
@@ -283,13 +284,13 @@ npx @modelcontextprotocol/inspector cargo run
 - **Watcher feature-gating:** The `start_watcher` and `process_event` functions have two `#[cfg]`-gated versions each (with/without embeddings). This is necessary because `#[cfg]` on function parameters isn't supported in Rust. The watcher tests use a `call_start_watcher` helper that dispatches to the correct variant.
 - **rmcp `#[tool_router]` and `#[cfg]`:** The `#[tool_router]` proc macro expands before `cfg` is resolved, so `#[cfg(feature = "...")]` on individual `#[tool]` methods doesn't work — the macro generates references to the method unconditionally. The workaround is to always define the tool method and params, but provide two `#[cfg]`-gated implementations: one that delegates to the real logic, and one that returns an error explaining the feature isn't compiled in.
 - **fastembed concurrent model loading:** `fastembed::TextEmbedding::try_new()` has race conditions when multiple instances try to load the same model concurrently (corrupted cache access). Integration tests use a static `tokio::sync::Mutex` to serialize `Vault::open()` calls that trigger model loading.
-- **Hybrid re-ranking (E7):** `search_semantic` with `lexical_prefetch: true` runs a two-stage pipeline: Tantivy BM25 retrieves top-50 candidates, then each is re-scored via `alpha * norm_bm25 + (1-alpha) * cosine_sim` (alpha=0.4). BM25 scores are min-max normalized to [0,1] within the result set; when all scores are equal they normalize to 1.0. Notes missing from the embedding store (e.g., embedding failed) get semantic score 0.0. Requires both Tantivy (`OBSIDIAN_TANTIVY=true`) and embeddings (`OBSIDIAN_EMBEDDINGS=true` + `--features embeddings`).
+- **Hybrid re-ranking (E7):** `search_semantic` with `lexical_prefetch: true` runs a two-stage pipeline: Tantivy BM25 retrieves top-50 candidates, then each is re-scored via `alpha * norm_bm25 + (1-alpha) * cosine_sim`. Default alpha is 0.25 (configurable via `OBSIDIAN_HYBRID_ALPHA` env var or per-query `alpha` param). BM25 scores are min-max normalized to [0,1] within the result set; when all scores are equal they normalize to 1.0. Notes missing from the embedding store (e.g., embedding failed) get semantic score 0.0. Requires both Tantivy (`OBSIDIAN_TANTIVY=true`) and embeddings (`OBSIDIAN_EMBEDDINGS=true` + `--features embeddings`).
+- **Hybrid alpha resolution:** Per-query `alpha` param > `OBSIDIAN_HYBRID_ALPHA` env var > hardcoded default (0.25). Lower values favor semantic similarity; higher values favor keyword frequency. The default was lowered from 0.4 to 0.25 after testing showed the higher value degraded conceptual queries by over-weighting BM25 lexical matches.
+- **Semantic search snippets:** `SemanticSearchResult` includes a `snippet` field (populated when `include_content` is false). Snippets are extracted via query-word regex match + `extract_match_context` (100-char window). If no regex match (pure semantic hit), a fallback of the first ~200 chars of the note body (after frontmatter) is used.
 
 ## Task Tracking
 
 The full development plan with task breakdown, dependencies, and parallelization info is in `TODO.md`.
-
-## Links
 
 - **`CallToolResult::structured()` rejects null:** The Cursor MCP client validates `structuredContent` as a record (object). Passing `serde_json::Value::Null` via `CallToolResult::structured()` triggers a validation error. When a tool may return null, use `CallToolResult::success(vec![Content::text("null")])` for the null case and `CallToolResult::structured(value)` for real objects.
 - **`create_periodic_note` content override:** The method now accepts `content_override: Option<&str>` as the third parameter. When provided, it skips template expansion entirely. When `None`, missing template files are handled gracefully (`unwrap_or_default`) instead of erroring.

@@ -17,7 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(vault = %config.vault_path.display(), "starting obsidian-mcp");
 
     let vault = Vault::open(&config).await?;
-    let server = ObsidianMcp::new(vault)
+    let server = ObsidianMcp::new(vault, config.hybrid_alpha)
         .serve(rmcp::transport::io::stdio())
         .await?;
 
