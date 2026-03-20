@@ -147,7 +147,7 @@ impl ObsidianMcp {
 
     #[tool(
         name = "search_text",
-        description = "Full-text search across all notes (case-insensitive). Returns matching files with context snippets around each match."
+        description = "BM25-ranked full-text search across all notes. Returns matching files with relevance scores and context snippets. Supports stemming (e.g. 'program' matches 'programming'), optional fuzzy matching for typo tolerance, and field-level filtering."
     )]
     async fn search_text(
         &self,
@@ -187,6 +187,17 @@ impl ObsidianMcp {
         Parameters(params): Parameters<search::SearchFrontmatterParams>,
     ) -> Result<CallToolResult, ErrorData> {
         search::search_frontmatter(&self.vault, params).await
+    }
+
+    #[tool(
+        name = "search_semantic",
+        description = "Semantic search using local embeddings. Finds conceptually related notes without requiring exact keyword matches. Requires OBSIDIAN_EMBEDDINGS=true and the embeddings build feature."
+    )]
+    async fn search_semantic(
+        &self,
+        Parameters(params): Parameters<search::SearchSemanticParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        search::search_semantic(&self.vault, params).await
     }
 
     // ── Metadata ────────────────────────────────────────────────────

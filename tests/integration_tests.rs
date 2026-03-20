@@ -17,6 +17,9 @@ fn fixture_config() -> Config {
         vault_path: fixture_path(),
         watch: false,
         log_level: "error".into(),
+        tantivy: false,
+        embeddings: false,
+        embeddings_model: String::new(),
     }
 }
 
@@ -34,6 +37,9 @@ async fn copy_fixture_to_temp() -> (tempfile::TempDir, Vault) {
         vault_path: tmp.path().to_path_buf(),
         watch: false,
         log_level: "error".into(),
+        tantivy: false,
+        embeddings: false,
+        embeddings_model: String::new(),
     };
     let vault = Vault::open(&config)
         .await
@@ -293,6 +299,130 @@ mod vault_graph {
     }
 }
 
+// ── Tantivy BM25 search (temp copies with tantivy enabled) ──────────────
+
+mod vault_tantivy_search {
+    use super::*;
+    use obsidian_mcp::models::SearchField;
+
+    async fn copy_fixture_with_tantivy() -> (tempfile::TempDir, Vault) {
+        let tmp = tempfile::tempdir().unwrap();
+        copy_dir_recursive(&fixture_path(), tmp.path());
+        let config = Config {
+            vault_path: tmp.path().to_path_buf(),
+            watch: false,
+            log_level: "error".into(),
+            tantivy: true,
+            embeddings: false,
+            embeddings_model: String::new(),
+        };
+        let vault = Vault::open(&config)
+            .await
+            .expect("failed to open tantivy vault");
+        (tmp, vault)
+    }
+
+    #[tokio::test]
+    async fn search_text_returns_ranked_results() {
+        let (_tmp, vault) = copy_fixture_with_tantivy().await;
+        let results = vault.search_text("quantum entanglement", 40).unwrap();
+        assert!(!results.is_empty());
+        assert!(
+            results[0].score.is_some(),
+            "Tantivy search should populate scores"
+        );
+
+        if results.len() >= 2 {
+            let s0 = results[0].score.unwrap();
+            let s1 = results[1].score.unwrap();
+            assert!(s0 >= s1, "results should be sorted by score descending");
+        }
+    }
+
+    #[tokio::test]
+    async fn search_text_stemming_finds_related_terms() {
+        let (_tmp, vault) = copy_fixture_with_tantivy().await;
+        // "server" appears in rust-mcp.md; "servers" stems to the same root
+        let results = vault.search_text("servers", 40).unwrap();
+        assert!(
+            !results.is_empty(),
+            "stemming should match 'servers' → 'server'"
+        );
+        assert!(results[0].score.is_some());
+    }
+
+    #[tokio::test]
+    async fn search_text_with_options_fuzzy() {
+        let (_tmp, vault) = copy_fixture_with_tantivy().await;
+
+        vault
+            .write_note(
+                Path::new("fuzzy_target.md"),
+                "# Architecture\nMicroservices architecture patterns.\n",
+            )
+            .unwrap();
+
+        // "architeture" has a typo (missing 'c')
+        let results = vault
+            .search_text_with_options("architeture", 40, 10, true, None)
+            .unwrap();
+        assert!(
+            results
+                .iter()
+                .any(|r| r.path == PathBuf::from("fuzzy_target.md")),
+            "fuzzy should find 'architecture' from 'architeture'"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_text_with_options_field_filter() {
+        let (_tmp, vault) = copy_fixture_with_tantivy().await;
+
+        vault
+            .write_note(
+                Path::new("elasticsearch.md"),
+                "# Elasticsearch\nDatabase internals and indexing.\n",
+            )
+            .unwrap();
+
+        // Title field = filename stem = "elasticsearch"
+        let title_results = vault
+            .search_text_with_options("elasticsearch", 40, 10, false, Some(&[SearchField::Title]))
+            .unwrap();
+        assert!(
+            title_results
+                .iter()
+                .any(|r| r.path == PathBuf::from("elasticsearch.md"))
+        );
+
+        // "indexing" appears only in the body, not title
+        let body_results = vault
+            .search_text_with_options("indexing", 40, 10, false, Some(&[SearchField::Body]))
+            .unwrap();
+        assert!(
+            body_results
+                .iter()
+                .any(|r| r.path == PathBuf::from("elasticsearch.md"))
+        );
+    }
+
+    #[tokio::test]
+    async fn search_text_context_snippets_from_tantivy() {
+        let (_tmp, vault) = copy_fixture_with_tantivy().await;
+        let results = vault.search_text("quantum entanglement", 80).unwrap();
+
+        assert!(!results.is_empty());
+        let first = &results[0];
+        assert!(!first.matches.is_empty(), "should have context snippets");
+        let ctx = &first.matches[0].context;
+        let has_any_word = ctx.contains("quantum") || ctx.contains("entanglement");
+        assert!(
+            has_any_word,
+            "context should contain at least one query word"
+        );
+    }
+}
+
 // ── Write operations (temp copies) ───────────────────────────────────────
 
 mod vault_write {
@@ -484,5 +614,216 @@ mod vault_periodic {
         assert!(path.to_string_lossy().contains("2026-01-15"));
         let content = vault.read_note(&path).unwrap();
         assert!(content.is_empty() || content.contains("2026"));
+    }
+}
+
+// ── Semantic search (embeddings feature) ────────────────────────────────
+
+#[cfg(feature = "embeddings")]
+mod vault_semantic_search {
+    use super::*;
+
+    /// Serialize model loading across tests to prevent concurrent fastembed
+    /// cache access races.
+    static MODEL_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    fn embeddings_config(vault_root: &Path) -> Config {
+        Config {
+            vault_path: vault_root.to_path_buf(),
+            watch: false,
+            log_level: "error".into(),
+            tantivy: false,
+            embeddings: true,
+            embeddings_model: "BAAI/bge-small-en-v1.5".into(),
+        }
+    }
+
+    async fn open_with_embeddings(vault_root: &Path) -> Vault {
+        let _guard = MODEL_LOCK.lock().await;
+        let config = embeddings_config(vault_root);
+        Vault::open(&config)
+            .await
+            .expect("open vault with embeddings")
+    }
+
+    #[tokio::test]
+    async fn search_semantic_returns_results() {
+        let (_tmp, _vault) = copy_fixture_to_temp().await;
+        let vault = open_with_embeddings(_tmp.path()).await;
+
+        let results = vault.search_semantic("programming languages", 5).unwrap();
+        assert!(
+            !results.is_empty(),
+            "semantic search should return results for the fixture vault"
+        );
+        if results.len() >= 2 {
+            assert!(
+                results[0].1 >= results[1].1,
+                "results should be sorted by descending score"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn search_semantic_empty_vault_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".obsidian")).unwrap();
+        let vault = open_with_embeddings(tmp.path()).await;
+
+        let results = vault.search_semantic("anything", 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_semantic_disabled_returns_error() {
+        let (_tmp, vault) = copy_fixture_to_temp().await;
+        let result = vault.search_semantic("test query", 5);
+        assert!(
+            result.is_err(),
+            "search_semantic should fail when embeddings are disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_semantic_syncs_on_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".obsidian")).unwrap();
+        let vault = open_with_embeddings(tmp.path()).await;
+
+        vault
+            .write_note(
+                Path::new("rust.md"),
+                "# Rust\nRust is a systems programming language known for memory safety.\n",
+            )
+            .unwrap();
+
+        let results = vault.search_semantic("memory safe programming", 5).unwrap();
+        assert!(
+            results.iter().any(|(p, _)| p == Path::new("rust.md")),
+            "newly written note should appear in semantic search"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_semantic_syncs_on_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".obsidian")).unwrap();
+        let vault = open_with_embeddings(tmp.path()).await;
+
+        vault
+            .write_note(
+                Path::new("gone.md"),
+                "# Ephemeral\nThis note will be deleted soon.\n",
+            )
+            .unwrap();
+        vault.delete_note(Path::new("gone.md")).unwrap();
+
+        let results = vault.search_semantic("ephemeral deleted", 5).unwrap();
+        assert!(
+            !results.iter().any(|(p, _)| p == Path::new("gone.md")),
+            "deleted note should not appear in semantic search"
+        );
+    }
+
+    // ── hybrid search (E7) ──────────────────────────────────────────
+
+    fn hybrid_config(vault_root: &Path) -> Config {
+        Config {
+            tantivy: true,
+            ..embeddings_config(vault_root)
+        }
+    }
+
+    async fn open_hybrid(vault_root: &Path) -> Vault {
+        let _guard = MODEL_LOCK.lock().await;
+        let config = hybrid_config(vault_root);
+        Vault::open(&config)
+            .await
+            .expect("open vault with tantivy + embeddings")
+    }
+
+    #[tokio::test]
+    async fn search_hybrid_returns_results() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".obsidian")).unwrap();
+        let vault = open_hybrid(tmp.path()).await;
+
+        vault
+            .write_note(
+                Path::new("rust.md"),
+                "# Rust\nRust is a systems programming language known for memory safety.\n",
+            )
+            .unwrap();
+        vault
+            .write_note(
+                Path::new("python.md"),
+                "# Python\nPython is a dynamic language for scripting and data science.\n",
+            )
+            .unwrap();
+
+        let results = vault
+            .search_hybrid("systems programming", 5, 50, 0.4)
+            .unwrap();
+        assert!(!results.is_empty(), "hybrid search should return results");
+        assert!(
+            results.iter().any(|(p, _)| p == Path::new("rust.md")),
+            "rust.md should be in hybrid results for 'systems programming'"
+        );
+        if results.len() >= 2 {
+            assert!(
+                results[0].1 >= results[1].1,
+                "results should be sorted by descending combined score"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn search_hybrid_empty_query_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".obsidian")).unwrap();
+        let vault = open_hybrid(tmp.path()).await;
+
+        vault
+            .write_note(Path::new("note.md"), "# Note\nSome content.\n")
+            .unwrap();
+
+        let results = vault.search_hybrid("", 5, 50, 0.4).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_hybrid_without_tantivy_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".obsidian")).unwrap();
+        let vault = open_with_embeddings(tmp.path()).await;
+
+        let result = vault.search_hybrid("test", 5, 50, 0.4);
+        assert!(
+            result.is_err(),
+            "hybrid search should fail when Tantivy is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_hybrid_syncs_after_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".obsidian")).unwrap();
+        let vault = open_hybrid(tmp.path()).await;
+
+        vault
+            .write_note(
+                Path::new("quantum.md"),
+                "# Quantum Computing\nQuantum computers use qubits for exponential parallelism.\n",
+            )
+            .unwrap();
+
+        let results = vault
+            .search_hybrid("quantum computing", 5, 50, 0.4)
+            .unwrap();
+        assert!(
+            results.iter().any(|(p, _)| p == Path::new("quantum.md")),
+            "newly written note should appear in hybrid search"
+        );
     }
 }

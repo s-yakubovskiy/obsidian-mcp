@@ -9,8 +9,12 @@ pub mod index;
 pub mod parser;
 pub mod patch;
 pub mod periodic;
+pub mod tantivy_index;
 pub mod watcher;
 pub mod wikilink;
+
+#[cfg(feature = "embeddings")]
+pub mod embeddings;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -18,18 +22,27 @@ use std::sync::{Arc, Mutex, RwLock};
 use chrono::{Local, NaiveDate};
 use notify_debouncer_mini::Debouncer;
 
+use regex::Regex;
+
 use crate::config::Config;
 use crate::error::{VaultError, VaultResult};
 use crate::models::{
-    DocumentMap, NoteMetadata, NotePeriod, PatchRequest, SearchResult, VaultStats, WikiLink,
+    DocumentMap, NoteMetadata, NotePeriod, PatchRequest, SearchField, SearchMatch, SearchResult,
+    VaultStats, WikiLink,
 };
 
 use self::index::VaultIndex;
+use self::tantivy_index::TantivyIndex;
 
 /// Internal shared state wrapped in `Arc` for cheap cloning.
 struct VaultInner {
     root: PathBuf,
     index: Arc<RwLock<VaultIndex>>,
+    tantivy: Option<Arc<TantivyIndex>>,
+    #[cfg(feature = "embeddings")]
+    embedding_model: Option<Arc<embeddings::EmbeddingModel>>,
+    #[cfg(feature = "embeddings")]
+    embedding_store: Option<Arc<RwLock<embeddings::EmbeddingStore>>>,
     /// Kept alive to sustain filesystem watching; never accessed after construction.
     /// Wrapped in `Mutex` to guarantee `Sync` (`Debouncer` contains a `mpsc::Sender`
     /// which is `Send` but not `Sync`).
@@ -64,10 +77,46 @@ impl Vault {
         }
 
         let vi = VaultIndex::build(&root).await?;
+
+        let tantivy = if config.tantivy {
+            let tv = TantivyIndex::build(&root, vi.notes())?;
+            tracing::info!(notes = vi.notes().len(), "tantivy BM25 index built");
+            Some(Arc::new(tv))
+        } else {
+            None
+        };
+
         let index = Arc::new(RwLock::new(vi));
 
+        #[cfg(feature = "embeddings")]
+        let (embedding_model, embedding_store) = if config.embeddings {
+            let model = embeddings::EmbeddingModel::load(&config.embeddings_model).await?;
+            let model = Arc::new(model);
+            let store = Self::build_or_load_embeddings(&root, &index, &model)?;
+            let store = Arc::new(RwLock::new(store));
+            tracing::info!(
+                notes = index.read().expect("index lock poisoned").notes().len(),
+                dim = model.dim(),
+                "embedding store ready"
+            );
+            (Some(model), Some(store))
+        } else {
+            (None, None)
+        };
+
         let watcher_handle = if config.watch {
-            Some(watcher::start_watcher(root.clone(), Arc::clone(&index))?)
+            #[cfg(feature = "embeddings")]
+            let debouncer = watcher::start_watcher(
+                root.clone(),
+                Arc::clone(&index),
+                tantivy.clone(),
+                embedding_model.clone(),
+                embedding_store.clone(),
+            )?;
+            #[cfg(not(feature = "embeddings"))]
+            let debouncer =
+                watcher::start_watcher(root.clone(), Arc::clone(&index), tantivy.clone())?;
+            Some(debouncer)
         } else {
             None
         };
@@ -76,6 +125,11 @@ impl Vault {
             inner: Arc::new(VaultInner {
                 root,
                 index,
+                tantivy,
+                #[cfg(feature = "embeddings")]
+                embedding_model,
+                #[cfg(feature = "embeddings")]
+                embedding_store,
                 _watcher: Mutex::new(watcher_handle),
             }),
         })
@@ -84,6 +138,11 @@ impl Vault {
     /// Vault root path (canonicalized).
     pub fn root(&self) -> &Path {
         &self.inner.root
+    }
+
+    /// Access the Tantivy BM25 index (if enabled via `Config::tantivy`).
+    pub fn tantivy(&self) -> Option<&TantivyIndex> {
+        self.inner.tantivy.as_deref()
     }
 
     // ── fs delegation ──────────────────────────────────────────────────
@@ -151,13 +210,31 @@ impl Vault {
     pub fn delete_note(&self, path: &Path) -> VaultResult<()> {
         fs::delete_file(&self.inner.root, path)?;
         self.write_index().remove_file(path);
+        if let Some(tv) = &self.inner.tantivy {
+            tv.remove_file(path)?;
+        }
+        #[cfg(feature = "embeddings")]
+        self.remove_embedding(path);
         Ok(())
     }
 
     pub fn move_note(&self, from: &Path, to: &Path) -> VaultResult<PathBuf> {
         let new_path = fs::move_file(&self.inner.root, from, to)?;
-        self.write_index()
-            .rename_file(&self.inner.root, from, &new_path)?;
+        {
+            let mut idx = self.write_index();
+            idx.rename_file(&self.inner.root, from, &new_path)?;
+            if let Some(tv) = &self.inner.tantivy {
+                tv.remove_file(from)?;
+                if let Some(meta) = idx.get_note(&new_path) {
+                    tv.reindex_file(&self.inner.root, &new_path, meta)?;
+                }
+            }
+        }
+        #[cfg(feature = "embeddings")]
+        {
+            self.remove_embedding(from);
+            self.reindex_embedding(&new_path);
+        }
         Ok(new_path)
     }
 
@@ -214,8 +291,38 @@ impl Vault {
     }
 
     pub fn search_text(&self, query: &str, context_len: usize) -> VaultResult<Vec<SearchResult>> {
-        self.read_index()
-            .search_text(&self.inner.root, query, context_len)
+        match &self.inner.tantivy {
+            Some(tv) => self.tantivy_search_with_context(tv, query, context_len, 200, false, None),
+            None => self
+                .read_index()
+                .search_text(&self.inner.root, query, context_len),
+        }
+    }
+
+    /// Full-text search with additional Tantivy options (fuzzy, field filter).
+    ///
+    /// Falls back to `VaultIndex::search_text` (ignoring fuzzy/fields) when
+    /// Tantivy is disabled.
+    pub fn search_text_with_options(
+        &self,
+        query: &str,
+        context_len: usize,
+        max_results: usize,
+        fuzzy: bool,
+        fields: Option<&[SearchField]>,
+    ) -> VaultResult<Vec<SearchResult>> {
+        match &self.inner.tantivy {
+            Some(tv) => {
+                self.tantivy_search_with_context(tv, query, context_len, max_results, fuzzy, fields)
+            }
+            None => {
+                let mut results =
+                    self.read_index()
+                        .search_text(&self.inner.root, query, context_len)?;
+                results.truncate(max_results);
+                Ok(results)
+            }
+        }
     }
 
     pub fn search_regex(
@@ -225,6 +332,93 @@ impl Vault {
     ) -> VaultResult<Vec<SearchResult>> {
         self.read_index()
             .search_regex(&self.inner.root, pattern, context_len)
+    }
+
+    /// Semantic search via embedding cosine similarity (Layer 2).
+    ///
+    /// Embeds the query, then performs brute-force cosine similarity against
+    /// the embedding store. Returns `(path, score)` pairs sorted by descending
+    /// similarity.
+    #[cfg(feature = "embeddings")]
+    pub fn search_semantic(&self, query: &str, top_k: usize) -> VaultResult<Vec<(PathBuf, f32)>> {
+        let model = self.inner.embedding_model.as_ref().ok_or_else(|| {
+            VaultError::Embedding("embeddings not enabled (OBSIDIAN_EMBEDDINGS=false)".into())
+        })?;
+        let store = self
+            .inner
+            .embedding_store
+            .as_ref()
+            .ok_or_else(|| VaultError::Embedding("embedding store not initialized".into()))?;
+
+        let query_vec = model.embed_one(query)?;
+        let s = store.read().expect("embedding store lock poisoned");
+        Ok(s.query(&query_vec, top_k))
+    }
+
+    /// Returns `true` if embeddings are available for semantic search.
+    #[cfg(feature = "embeddings")]
+    pub fn has_embeddings(&self) -> bool {
+        self.inner.embedding_model.is_some() && self.inner.embedding_store.is_some()
+    }
+
+    /// Hybrid search: BM25 prefetch via Tantivy, then re-rank by combining
+    /// normalized BM25 scores with semantic cosine similarity.
+    ///
+    /// Requires both Tantivy and embeddings to be enabled.
+    ///
+    /// `alpha` controls the balance: `final = alpha * norm_bm25 + (1-alpha) * cosine_sim`.
+    /// Lower alpha = more weight to semantic meaning.
+    #[cfg(feature = "embeddings")]
+    pub fn search_hybrid(
+        &self,
+        query: &str,
+        top_k: usize,
+        prefetch_count: usize,
+        alpha: f32,
+    ) -> VaultResult<Vec<(PathBuf, f32)>> {
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let tv = self.inner.tantivy.as_ref().ok_or_else(|| {
+            VaultError::Other("hybrid search requires Tantivy (set OBSIDIAN_TANTIVY=true)".into())
+        })?;
+        let model = self.inner.embedding_model.as_ref().ok_or_else(|| {
+            VaultError::Embedding("embeddings not enabled (OBSIDIAN_EMBEDDINGS=false)".into())
+        })?;
+        let store = self
+            .inner
+            .embedding_store
+            .as_ref()
+            .ok_or_else(|| VaultError::Embedding("embedding store not initialized".into()))?;
+
+        let prefetch = prefetch_count.max(top_k);
+        let bm25_hits = tv.search(query, prefetch)?;
+        if bm25_hits.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let query_vec = model.embed_one(query)?;
+        let store_guard = store.read().expect("embedding store lock poisoned");
+
+        let norm_bm25 = normalize_bm25_scores(&bm25_hits);
+
+        let mut combined: Vec<(PathBuf, f32)> = norm_bm25
+            .into_iter()
+            .map(|(path, norm_score)| {
+                let semantic_score = store_guard
+                    .get(&path)
+                    .map(|emb| embeddings::cosine_similarity(&query_vec, emb))
+                    .unwrap_or(0.0);
+                let final_score = alpha * norm_score + (1.0 - alpha) * semantic_score;
+                (path, final_score)
+            })
+            .collect();
+
+        combined
+            .sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        combined.truncate(top_k);
+        Ok(combined)
     }
 
     pub fn search_by_tag(&self, tag: &str) -> VaultResult<Vec<NoteMetadata>> {
@@ -388,6 +582,70 @@ impl Vault {
 
     // ── private helpers ────────────────────────────────────────────────
 
+    /// Two-phase Tantivy search: BM25 ranking then context extraction.
+    ///
+    /// 1. Rank: Tantivy returns top-K `(path, score)` via BM25.
+    /// 2. Context: For each hit, read the file and locate query words with a
+    ///    case-insensitive regex to produce `SearchMatch` snippets.
+    ///
+    /// If the query matched only through stemming (no literal occurrence of
+    /// any query word), the `matches` vec will be empty but `score` is populated.
+    fn tantivy_search_with_context(
+        &self,
+        tv: &TantivyIndex,
+        query: &str,
+        context_len: usize,
+        max_results: usize,
+        fuzzy: bool,
+        fields: Option<&[SearchField]>,
+    ) -> VaultResult<Vec<SearchResult>> {
+        let hits = if fuzzy || fields.is_some() {
+            tv.search_with_options(query, max_results, fuzzy, fields)?
+        } else {
+            tv.search(query, max_results)?
+        };
+
+        let word_pattern: String = query
+            .split_whitespace()
+            .map(regex::escape)
+            .collect::<Vec<_>>()
+            .join("|");
+
+        let word_re = if word_pattern.is_empty() {
+            None
+        } else {
+            Regex::new(&format!("(?i){word_pattern}")).ok()
+        };
+
+        let mut results = Vec::with_capacity(hits.len());
+        for (path, score) in hits {
+            let matches = match (word_re.as_ref(), fs::read_file(&self.inner.root, &path)) {
+                (Some(re), Ok(content)) if context_len > 0 => re
+                    .find_iter(&content)
+                    .map(|m| {
+                        let (context, match_start, match_end, line) =
+                            index::extract_match_context(&content, m.start(), m.end(), context_len);
+                        SearchMatch {
+                            line,
+                            context,
+                            match_start,
+                            match_end,
+                        }
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+
+            results.push(SearchResult {
+                path,
+                matches,
+                score: Some(score as f64),
+            });
+        }
+
+        Ok(results)
+    }
+
     fn read_index(&self) -> std::sync::RwLockReadGuard<'_, VaultIndex> {
         self.inner.index.read().expect("index lock poisoned")
     }
@@ -397,8 +655,176 @@ impl Vault {
     }
 
     fn reindex(&self, path: &Path) -> VaultResult<()> {
-        self.write_index().reindex_file(&self.inner.root, path)
+        let mut idx = self.write_index();
+        idx.reindex_file(&self.inner.root, path)?;
+        if let Some(tv) = &self.inner.tantivy
+            && let Some(meta) = idx.get_note(path)
+        {
+            tv.reindex_file(&self.inner.root, path, meta)?;
+        }
+        drop(idx);
+        #[cfg(feature = "embeddings")]
+        self.reindex_embedding(path);
+        Ok(())
     }
+
+    // ── embedding helpers (feature-gated) ─────────────────────────────
+
+    #[cfg(feature = "embeddings")]
+    fn embedding_cache_path(vault_root: &Path) -> PathBuf {
+        vault_root
+            .join(".obsidian")
+            .join("obsidian-mcp")
+            .join("embeddings.bin")
+    }
+
+    /// Load cached embeddings or rebuild from scratch.
+    #[cfg(feature = "embeddings")]
+    fn build_or_load_embeddings(
+        vault_root: &Path,
+        index: &Arc<RwLock<VaultIndex>>,
+        model: &embeddings::EmbeddingModel,
+    ) -> VaultResult<embeddings::EmbeddingStore> {
+        let cache_path = Self::embedding_cache_path(vault_root);
+        let idx = index.read().expect("index lock poisoned");
+        let note_count = idx.notes().len();
+
+        if let Ok(store) = embeddings::EmbeddingStore::load(&cache_path) {
+            if store.dim() == model.dim() && store.len() == note_count {
+                tracing::info!(cached = store.len(), "loaded embedding cache");
+                return Ok(store);
+            }
+            tracing::info!(
+                cached = store.len(),
+                current = note_count,
+                "embedding cache stale, rebuilding"
+            );
+        }
+
+        let mut store = embeddings::EmbeddingStore::new(model.dim());
+
+        let entries: Vec<(PathBuf, String)> = idx
+            .notes()
+            .iter()
+            .filter_map(|(path, meta)| {
+                let content = fs::read_file(vault_root, path).ok()?;
+                let body = frontmatter::get_body(&content);
+                let heading_texts: Vec<String> =
+                    meta.headings.iter().map(|h| h.text.clone()).collect();
+                let text = embeddings::prepare_embed_text(&meta.title, &heading_texts, body);
+                Some((path.clone(), text))
+            })
+            .collect();
+
+        let batch_size = 64;
+        for chunk in entries.chunks(batch_size) {
+            let texts: Vec<&str> = chunk.iter().map(|(_, t)| t.as_str()).collect();
+            match model.embed_batch(&texts) {
+                Ok(vecs) => {
+                    for ((path, _), vec) in chunk.iter().zip(vecs) {
+                        store.insert(path.clone(), vec);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "embedding batch failed, skipping chunk");
+                }
+            }
+        }
+
+        if let Err(e) = store.save(&cache_path) {
+            tracing::warn!(error = %e, "failed to save embedding cache");
+        }
+
+        Ok(store)
+    }
+
+    /// Re-embed a single note and update the store. Non-fatal on error.
+    #[cfg(feature = "embeddings")]
+    fn reindex_embedding(&self, path: &Path) {
+        let (Some(model), Some(store)) = (&self.inner.embedding_model, &self.inner.embedding_store)
+        else {
+            return;
+        };
+
+        let Ok(content) = fs::read_file(&self.inner.root, path) else {
+            return;
+        };
+
+        let idx = self.read_index();
+        let Some(meta) = idx.get_note(path) else {
+            return;
+        };
+
+        let body = frontmatter::get_body(&content);
+        let heading_texts: Vec<String> = meta.headings.iter().map(|h| h.text.clone()).collect();
+        let text = embeddings::prepare_embed_text(&meta.title, &heading_texts, body);
+        drop(idx);
+
+        match model.embed_one(&text) {
+            Ok(vec) => {
+                let mut s = store.write().expect("embedding store lock poisoned");
+                s.insert(path.to_path_buf(), vec);
+                drop(s);
+                self.save_embedding_cache();
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "embedding failed");
+            }
+        }
+    }
+
+    /// Remove a note's embedding from the store.
+    #[cfg(feature = "embeddings")]
+    fn remove_embedding(&self, path: &Path) {
+        if let Some(store) = &self.inner.embedding_store {
+            let mut s = store.write().expect("embedding store lock poisoned");
+            s.remove(path);
+            drop(s);
+            self.save_embedding_cache();
+        }
+    }
+
+    /// Persist the embedding cache to disk. Non-fatal on error.
+    #[cfg(feature = "embeddings")]
+    fn save_embedding_cache(&self) {
+        if let Some(store) = &self.inner.embedding_store {
+            let s = store.read().expect("embedding store lock poisoned");
+            let cache_path = Self::embedding_cache_path(&self.inner.root);
+            if let Err(e) = s.save(&cache_path) {
+                tracing::warn!(error = %e, "failed to save embedding cache");
+            }
+        }
+    }
+}
+
+// ── Hybrid search helpers ──────────────────────────────────────────────
+
+/// Min-max normalize BM25 scores to [0, 1].
+///
+/// When all scores are identical (max == min), all normalized values are 1.0.
+#[cfg(feature = "embeddings")]
+fn normalize_bm25_scores(hits: &[(PathBuf, f32)]) -> Vec<(PathBuf, f32)> {
+    if hits.is_empty() {
+        return Vec::new();
+    }
+
+    let min = hits.iter().map(|(_, s)| *s).fold(f32::INFINITY, f32::min);
+    let max = hits
+        .iter()
+        .map(|(_, s)| *s)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let range = max - min;
+
+    hits.iter()
+        .map(|(path, score)| {
+            let normalized = if range == 0.0 {
+                1.0
+            } else {
+                (score - min) / range
+            };
+            (path.clone(), normalized)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -414,6 +840,9 @@ mod tests {
             vault_path: vault_root.to_path_buf(),
             watch: false,
             log_level: "error".into(),
+            tantivy: false,
+            embeddings: false,
+            embeddings_model: String::new(),
         }
     }
 
@@ -446,6 +875,9 @@ mod tests {
             vault_path: PathBuf::from("/nonexistent/path/that/does/not/exist"),
             watch: false,
             log_level: "error".into(),
+            tantivy: false,
+            embeddings: false,
+            embeddings_model: String::new(),
         };
 
         let result = Vault::open(&config).await;
@@ -748,5 +1180,323 @@ mod tests {
     fn vault_is_send_sync_clone() {
         fn assert_send_sync_clone<T: Send + Sync + Clone>() {}
         assert_send_sync_clone::<Vault>();
+    }
+
+    fn tantivy_config(vault_root: &Path) -> Config {
+        Config {
+            vault_path: vault_root.to_path_buf(),
+            watch: false,
+            log_level: "error".into(),
+            tantivy: true,
+            embeddings: false,
+            embeddings_model: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn vault_open_with_tantivy() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+
+        std::fs::write(
+            dir.path().join("note.md"),
+            "# Rust\nRust is a systems language.\n",
+        )
+        .unwrap();
+
+        let vault = Vault::open(&tantivy_config(dir.path())).await.unwrap();
+        assert!(vault.tantivy().is_some());
+    }
+
+    #[tokio::test]
+    async fn vault_tantivy_syncs_on_write() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&tantivy_config(dir.path())).await.unwrap();
+
+        vault
+            .write_note(
+                Path::new("alpha.md"),
+                "# Alpha\nUnique content about zebras.\n",
+            )
+            .unwrap();
+
+        let tv = vault.tantivy().unwrap();
+        let results = tv.search("zebras", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, PathBuf::from("alpha.md"));
+    }
+
+    #[tokio::test]
+    async fn vault_tantivy_syncs_on_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&tantivy_config(dir.path())).await.unwrap();
+
+        vault
+            .write_note(Path::new("del.md"), "# Deletable\nEphemeral content.\n")
+            .unwrap();
+        assert_eq!(
+            vault
+                .tantivy()
+                .unwrap()
+                .search("ephemeral", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        vault.delete_note(Path::new("del.md")).unwrap();
+        assert!(
+            vault
+                .tantivy()
+                .unwrap()
+                .search("ephemeral", 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn vault_tantivy_syncs_on_move() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&tantivy_config(dir.path())).await.unwrap();
+
+        vault
+            .write_note(Path::new("src.md"), "# Source\nMovable content.\n")
+            .unwrap();
+        vault
+            .move_note(Path::new("src.md"), Path::new("dest.md"))
+            .unwrap();
+
+        let tv = vault.tantivy().unwrap();
+        let results = tv.search("movable", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, PathBuf::from("dest.md"));
+    }
+
+    #[tokio::test]
+    async fn vault_tantivy_syncs_on_create() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&tantivy_config(dir.path())).await.unwrap();
+
+        let fm = serde_json::json!({"tags": ["science"]});
+        vault
+            .create_note(
+                Path::new("created.md"),
+                "# Created\nBioluminescence in deep sea creatures.\n",
+                Some(&fm),
+            )
+            .unwrap();
+
+        let tv = vault.tantivy().unwrap();
+        let results = tv.search("bioluminescence", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, PathBuf::from("created.md"));
+    }
+
+    #[tokio::test]
+    async fn vault_search_text_tantivy_returns_scores() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&tantivy_config(dir.path())).await.unwrap();
+
+        vault
+            .write_note(
+                Path::new("a.md"),
+                "# Quantum\nQuantum computing is fascinating.\n",
+            )
+            .unwrap();
+        vault
+            .write_note(Path::new("b.md"), "# Other\nNothing related.\n")
+            .unwrap();
+
+        let results = vault.search_text("quantum", 40).unwrap();
+        assert!(!results.is_empty());
+        assert!(results[0].score.is_some());
+        assert!(results[0].score.unwrap() > 0.0);
+        assert_eq!(results[0].path, PathBuf::from("a.md"));
+    }
+
+    #[tokio::test]
+    async fn vault_search_text_with_options_fuzzy() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&tantivy_config(dir.path())).await.unwrap();
+
+        vault
+            .write_note(Path::new("target.md"), "# Algorithm\nSorting algorithms.\n")
+            .unwrap();
+
+        // "algorihm" is a typo for "algorithm"
+        let results = vault
+            .search_text_with_options("algorihm", 40, 10, true, None)
+            .unwrap();
+        assert!(
+            results.iter().any(|r| r.path == PathBuf::from("target.md")),
+            "fuzzy search should find 'algorithm' from typo 'algorihm'"
+        );
+    }
+
+    #[tokio::test]
+    async fn vault_search_text_with_options_field_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&tantivy_config(dir.path())).await.unwrap();
+
+        vault
+            .write_note(
+                Path::new("headingmatch.md"),
+                "# Something Else\n## Cryptography Section\nBasic text.\n",
+            )
+            .unwrap();
+
+        let heading_only = vault
+            .search_text_with_options(
+                "cryptography",
+                40,
+                10,
+                false,
+                Some(&[SearchField::Headings]),
+            )
+            .unwrap();
+        assert!(
+            heading_only
+                .iter()
+                .any(|r| r.path == PathBuf::from("headingmatch.md"))
+        );
+    }
+
+    #[tokio::test]
+    async fn vault_search_text_tantivy_zero_context() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&tantivy_config(dir.path())).await.unwrap();
+
+        vault
+            .write_note(
+                Path::new("ctx.md"),
+                "# Context Test\nSearchable unique phrase here.\n",
+            )
+            .unwrap();
+
+        let results = vault.search_text("searchable", 0).unwrap();
+        assert!(!results.is_empty());
+        assert!(results[0].score.is_some());
+        assert!(
+            results[0].matches.is_empty(),
+            "context_length=0 should produce no match snippets"
+        );
+    }
+
+    #[tokio::test]
+    async fn vault_search_text_with_options_fallback_without_tantivy() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+
+        vault
+            .write_note(
+                Path::new("fallback.md"),
+                "# Fallback\nFallback search content.\n",
+            )
+            .unwrap();
+
+        let results = vault
+            .search_text_with_options("fallback", 40, 10, true, None)
+            .unwrap();
+        assert!(
+            results
+                .iter()
+                .any(|r| r.path == PathBuf::from("fallback.md")),
+            "should still find results via regex fallback when tantivy is disabled"
+        );
+        assert!(
+            results[0].score.is_none(),
+            "regex fallback should not populate BM25 scores"
+        );
+    }
+
+    // ── normalize_bm25_scores ────────────────────────────────────────
+
+    #[cfg(feature = "embeddings")]
+    mod normalize_tests {
+        use super::*;
+
+        #[test]
+        fn normalize_empty() {
+            assert!(normalize_bm25_scores(&[]).is_empty());
+        }
+
+        #[test]
+        fn normalize_single_score() {
+            let hits = vec![(PathBuf::from("a.md"), 5.0)];
+            let norm = normalize_bm25_scores(&hits);
+            assert_eq!(norm.len(), 1);
+            assert!(
+                (norm[0].1 - 1.0).abs() < 1e-6,
+                "single item normalizes to 1.0"
+            );
+        }
+
+        #[test]
+        fn normalize_identical_scores() {
+            let hits = vec![
+                (PathBuf::from("a.md"), 3.0),
+                (PathBuf::from("b.md"), 3.0),
+                (PathBuf::from("c.md"), 3.0),
+            ];
+            let norm = normalize_bm25_scores(&hits);
+            for (_, score) in &norm {
+                assert!(
+                    (score - 1.0).abs() < 1e-6,
+                    "identical scores should all normalize to 1.0"
+                );
+            }
+        }
+
+        #[test]
+        fn normalize_min_max_range() {
+            let hits = vec![
+                (PathBuf::from("high.md"), 10.0),
+                (PathBuf::from("mid.md"), 5.0),
+                (PathBuf::from("low.md"), 0.0),
+            ];
+            let norm = normalize_bm25_scores(&hits);
+
+            let high = norm
+                .iter()
+                .find(|(p, _)| p == Path::new("high.md"))
+                .unwrap()
+                .1;
+            let mid = norm
+                .iter()
+                .find(|(p, _)| p == Path::new("mid.md"))
+                .unwrap()
+                .1;
+            let low = norm
+                .iter()
+                .find(|(p, _)| p == Path::new("low.md"))
+                .unwrap()
+                .1;
+
+            assert!((high - 1.0).abs() < 1e-6);
+            assert!((mid - 0.5).abs() < 1e-6);
+            assert!(low.abs() < 1e-6);
+        }
+
+        #[test]
+        fn normalize_preserves_order() {
+            let hits = vec![
+                (PathBuf::from("first.md"), 8.0),
+                (PathBuf::from("second.md"), 4.0),
+                (PathBuf::from("third.md"), 2.0),
+            ];
+            let norm = normalize_bm25_scores(&hits);
+            assert!(norm[0].1 > norm[1].1);
+            assert!(norm[1].1 > norm[2].1);
+        }
     }
 }
