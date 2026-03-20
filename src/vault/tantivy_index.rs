@@ -7,8 +7,8 @@ use std::sync::Mutex;
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, BoostQuery, Occur, QueryParser, TermQuery};
 use tantivy::schema::{
-    Facet, Field, IndexRecordOption, OwnedValue, STORED, STRING, Schema, SchemaBuilder,
-    TextFieldIndexing, TextOptions,
+    Facet, Field, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder, TextFieldIndexing,
+    TextOptions, Value,
 };
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term, doc};
 
@@ -222,7 +222,7 @@ impl TantivyIndex {
         let mut results = Vec::with_capacity(top_docs.len());
         for (score, doc_address) in top_docs {
             let retrieved: TantivyDocument = searcher.doc(doc_address)?;
-            if let Some(OwnedValue::Str(path_str)) = retrieved.get_first(self.ts.f_path) {
+            if let Some(path_str) = retrieved.get_first(self.ts.f_path).and_then(|v| v.as_str()) {
                 results.push((PathBuf::from(path_str), score));
             }
         }
@@ -327,7 +327,7 @@ impl TantivyIndex {
         let mut results = Vec::with_capacity(top_docs.len());
         for (score, doc_address) in top_docs {
             let retrieved: TantivyDocument = searcher.doc(doc_address)?;
-            if let Some(OwnedValue::Str(path_str)) = retrieved.get_first(self.ts.f_path) {
+            if let Some(path_str) = retrieved.get_first(self.ts.f_path).and_then(|v| v.as_str()) {
                 results.push((PathBuf::from(path_str), score));
             }
         }
