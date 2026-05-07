@@ -77,7 +77,7 @@ pub async fn ensure_daemon(config: &BootstrapConfig) -> VaultResult<BootstrapRes
     let paths = home::semantic_home_paths(&semantic_home);
     home::ensure_home_layout(&paths)?;
 
-    let _install_lock = InstallLock::acquire(&paths)?;
+    let _install_lock = InstallLock::acquire_async(&paths).await?;
     let mut existing_manifest = manifest::load(&paths.manifest_path)?;
     let default_endpoint = home::default_ipc_endpoint(&paths);
 
@@ -135,8 +135,25 @@ pub async fn ensure_daemon(config: &BootstrapConfig) -> VaultResult<BootstrapRes
         binary_sha256 = Some(checksum);
     }
 
-    let child = start_daemon_process(&daemon_binary_path, &paths, &endpoint, &config.model_name)?;
+    let mut child =
+        start_daemon_process(&daemon_binary_path, &paths, &endpoint, &config.model_name)?;
     let pid = child.id().unwrap_or_default();
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            return Err(VaultError::DaemonBootstrap(format!(
+                "daemon process exited immediately with {status} \
+                 (binary: '{}', check {})",
+                daemon_binary_path.display(),
+                paths.daemon_stderr_log_path.display()
+            )));
+        }
+        Ok(None) => {}
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to check daemon process status after spawn");
+        }
+    }
     drop(child);
 
     let health = wait_for_health(&endpoint, Duration::from_secs(10)).await?;
@@ -278,6 +295,13 @@ fn extract_tar_gz_binary(archive_bytes: &[u8], destination: &Path) -> VaultResul
             continue;
         };
         if file_name == wanted_name {
+            if !entry.header().entry_type().is_file() {
+                return Err(VaultError::DaemonBootstrap(format!(
+                    "tar entry '{}' is not a regular file (type: {:?}); refusing to extract",
+                    file_name,
+                    entry.header().entry_type()
+                )));
+            }
             entry.unpack(destination).map_err(|err| {
                 VaultError::DaemonBootstrap(format!(
                     "failed to unpack daemon binary to '{}': {err}",
@@ -316,6 +340,18 @@ fn extract_zip_binary(archive_bytes: &[u8], destination: &Path) -> VaultResult<(
             continue;
         };
         if file_name == wanted_name {
+            if file.is_dir() {
+                return Err(VaultError::DaemonBootstrap(format!(
+                    "zip entry '{}' is a directory; refusing to extract",
+                    file.name()
+                )));
+            }
+            if file.name().contains("..") {
+                return Err(VaultError::DaemonBootstrap(format!(
+                    "zip entry '{}' contains path traversal sequence; refusing to extract",
+                    file.name()
+                )));
+            }
             let mut out = std::fs::File::create(destination)?;
             std::io::copy(&mut file, &mut out).map_err(|err| {
                 VaultError::DaemonBootstrap(format!(
@@ -448,7 +484,11 @@ async fn probe_health(endpoint: &IpcEndpoint) -> VaultResult<HealthProbeOutcome>
     let IpcEndpoint::NamedPipe(name) = endpoint;
     let stream = match ClientOptions::new().open(name) {
         Ok(stream) => stream,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+        Err(err)
+            if err.kind() == std::io::ErrorKind::NotFound
+                || err.kind() == std::io::ErrorKind::ConnectionRefused
+                || err.raw_os_error() == Some(231) =>
+        {
             return Ok(HealthProbeOutcome::Unreachable);
         }
         Err(err) => {

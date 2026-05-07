@@ -12,6 +12,9 @@ use crate::vault::Vault;
 
 use super::SemanticRuntime;
 
+const MAX_RESULTS_CAP: usize = 200;
+const MAX_CONTEXT_LEN_CAP: usize = 2000;
+
 // ── search_text ─────────────────────────────────────────────────────
 
 #[derive(Deserialize, JsonSchema, Default)]
@@ -38,8 +41,11 @@ pub async fn search_text(
     vault: &Vault,
     params: SearchTextParams,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    let context_length = params.context_length.unwrap_or(100);
-    let max_results = params.max_results.unwrap_or(20);
+    let context_length = params
+        .context_length
+        .unwrap_or(100)
+        .min(MAX_CONTEXT_LEN_CAP);
+    let max_results = params.max_results.unwrap_or(20).min(MAX_RESULTS_CAP);
     let fuzzy = params.fuzzy.unwrap_or(false);
 
     let results = if fuzzy || params.fields.is_some() {
@@ -79,8 +85,11 @@ pub async fn search_regex(
     vault: &Vault,
     params: SearchRegexParams,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    let context_length = params.context_length.unwrap_or(100);
-    let max_results = params.max_results.unwrap_or(20);
+    let context_length = params
+        .context_length
+        .unwrap_or(100)
+        .min(MAX_CONTEXT_LEN_CAP);
+    let max_results = params.max_results.unwrap_or(20).min(MAX_RESULTS_CAP);
 
     let results = vault.search_regex(&params.pattern, context_length)?;
     let limited: Vec<_> = results.into_iter().take(max_results).collect();
@@ -269,6 +278,9 @@ pub async fn search_semantic(
             Ok(results) => Ok(results),
             Err(err) if local_backend_available(vault) && should_fallback_to_local(&err) => {
                 tracing::warn!(error = %err, "semantic daemon unavailable in auto mode; falling back to local embeddings backend");
+                runtime
+                    .vault_ensured
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 search_semantic_local(
                     vault,
                     &params.query,
@@ -305,7 +317,19 @@ async fn search_semantic_daemon(
         return Err(VaultError::DaemonUnavailable(reason.to_string()));
     };
 
-    client.ensure_vault(vault.root(), true, None).await?;
+    if !runtime
+        .vault_ensured
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        match client.ensure_vault(vault.root(), true, None).await {
+            Ok(_) => {
+                runtime
+                    .vault_ensured
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(err) => return Err(err),
+        }
+    }
 
     let daemon_result = if lexical_prefetch {
         let prefetch_count = runtime.prefetch_count;
@@ -420,35 +444,7 @@ fn search_semantic_local(
 }
 
 #[cfg(feature = "embeddings")]
-fn body_preview(content: &str, max_chars: usize) -> String {
-    let start = if content.starts_with("---") {
-        content[3..]
-            .find("\n---")
-            .map(|i| {
-                let end = i + 7; // skip initial "---" (3) + "\n---" (4)
-                content[end..].find('\n').map_or(end, |nl| end + nl + 1)
-            })
-            .unwrap_or(0)
-    } else {
-        0
-    };
-    let body = content[start..].trim_start();
-    body.chars().take(max_chars).collect()
-}
-
-#[cfg(feature = "embeddings")]
-fn compile_query_word_regex(query: &str) -> Option<regex::Regex> {
-    let pattern: String = query
-        .split_whitespace()
-        .map(regex::escape)
-        .collect::<Vec<_>>()
-        .join("|");
-    if pattern.is_empty() {
-        None
-    } else {
-        regex::Regex::new(&format!("(?i){pattern}")).ok()
-    }
-}
+use crate::vault::search_utils::{body_preview, compile_query_word_regex};
 
 fn local_backend_available(vault: &Vault) -> bool {
     #[cfg(feature = "embeddings")]
@@ -500,7 +496,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::config::Config;
+    use crate::test_helpers::{create_test_vault, extract_text, tantivy_config, test_config};
     #[cfg(unix)]
     use crate::{
         client::semantic_daemon::{DaemonConnectPolicy, SemanticDaemonClient},
@@ -510,30 +506,6 @@ mod tests {
     use serde_json::json;
     #[cfg(unix)]
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-    fn test_config(vault_root: &Path) -> Config {
-        Config {
-            vault_path: vault_root.to_path_buf(),
-            watch: false,
-            log_level: "error".into(),
-            tantivy: false,
-            embeddings: false,
-            embeddings_model: String::new(),
-            hybrid_alpha: 0.25,
-        }
-    }
-
-    fn create_test_vault(dir: &Path) {
-        std::fs::create_dir_all(dir.join(".obsidian")).unwrap();
-    }
-
-    fn extract_text(result: &CallToolResult) -> &str {
-        result.content[0]
-            .as_text()
-            .expect("expected text content")
-            .text
-            .as_str()
-    }
 
     #[cfg(unix)]
     fn start_prefetch_capture_server(socket_path: PathBuf) -> tokio::task::JoinHandle<usize> {
@@ -923,18 +895,6 @@ mod tests {
 
     // ── search_text with Tantivy BM25 ──────────────────────────────
 
-    fn tantivy_config(vault_root: &Path) -> Config {
-        Config {
-            vault_path: vault_root.to_path_buf(),
-            watch: false,
-            log_level: "error".into(),
-            tantivy: true,
-            embeddings: false,
-            embeddings_model: String::new(),
-            hybrid_alpha: 0.25,
-        }
-    }
-
     async fn setup_tantivy_vault() -> (tempfile::TempDir, Vault) {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
@@ -1107,6 +1067,7 @@ mod tests {
             )),
             daemon_unavailable_reason: None,
             prefetch_count: 7,
+            vault_ensured: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let result = search_semantic(
@@ -1132,46 +1093,5 @@ mod tests {
             captured_prefetch, 7,
             "runtime prefetch should be used as-is"
         );
-    }
-
-    // ── body_preview ────────────────────────────────────────────────
-
-    #[cfg(feature = "embeddings")]
-    #[test]
-    fn body_preview_strips_frontmatter() {
-        let content = "---\ntags: [a]\n---\nHello world";
-        let preview = super::body_preview(content, 100);
-        assert_eq!(preview, "Hello world");
-    }
-
-    #[cfg(feature = "embeddings")]
-    #[test]
-    fn body_preview_no_frontmatter() {
-        let content = "# Title\nSome body text";
-        let preview = super::body_preview(content, 100);
-        assert_eq!(preview, "# Title\nSome body text");
-    }
-
-    #[cfg(feature = "embeddings")]
-    #[test]
-    fn body_preview_truncates() {
-        let content = "---\nk: v\n---\nABCDEFGHIJ";
-        let preview = super::body_preview(content, 5);
-        assert_eq!(preview, "ABCDE");
-    }
-
-    #[cfg(feature = "embeddings")]
-    #[test]
-    fn body_preview_empty_content() {
-        let preview = super::body_preview("", 100);
-        assert_eq!(preview, "");
-    }
-
-    #[cfg(feature = "embeddings")]
-    #[test]
-    fn body_preview_unclosed_frontmatter() {
-        let content = "---\ntags: [a]\nNo closing delimiter here";
-        let preview = super::body_preview(content, 200);
-        assert!(preview.contains("tags:"));
     }
 }

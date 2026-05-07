@@ -20,6 +20,7 @@ pub struct VaultInfoParams {}
 pub struct VaultInfo {
     #[serde(flatten)]
     pub stats: VaultStats,
+    pub vault_name: String,
     pub vault_path: String,
 }
 
@@ -31,6 +32,11 @@ pub async fn vault_info(
     let stats = vault.vault_stats()?;
     let info = VaultInfo {
         stats,
+        vault_name: vault
+            .root()
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
         vault_path: vault.root().display().to_string(),
     };
     let json = serde_json::to_string_pretty(&info).map_err(|e| VaultError::Other(e.to_string()))?;
@@ -99,9 +105,7 @@ fn launch_uri(uri: &str) -> Result<(), VaultError> {
     } else if cfg!(target_os = "linux") {
         std::process::Command::new("xdg-open").arg(uri).spawn()
     } else if cfg!(target_os = "windows") {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", uri])
-            .spawn()
+        std::process::Command::new("explorer").arg(uri).spawn()
     } else {
         return Err(VaultError::Other(
             "unsupported platform for opening URIs".into(),
@@ -116,23 +120,7 @@ fn launch_uri(uri: &str) -> Result<(), VaultError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
-
-    fn test_config(vault_root: &Path) -> Config {
-        Config {
-            vault_path: vault_root.to_path_buf(),
-            watch: false,
-            log_level: "error".into(),
-            tantivy: false,
-            embeddings: false,
-            embeddings_model: String::new(),
-            hybrid_alpha: 0.25,
-        }
-    }
-
-    fn create_test_vault(dir: &Path) {
-        std::fs::create_dir_all(dir.join(".obsidian")).unwrap();
-    }
+    use crate::test_helpers::{create_test_vault, test_config};
 
     #[tokio::test]
     async fn vault_info_returns_stats() {
