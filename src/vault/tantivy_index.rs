@@ -239,7 +239,7 @@ impl TantivyIndex {
             .parse_query(query)
             .map_err(|e| VaultError::Other(format!("tantivy query parse error: {e}")))?;
 
-        let top_docs = searcher.search(&parsed, &TopDocs::with_limit(top_k))?;
+        let top_docs = searcher.search(&parsed, &TopDocs::with_limit(top_k).order_by_score())?;
 
         let mut results = Vec::with_capacity(top_docs.len());
         for (score, doc_address) in top_docs {
@@ -344,7 +344,8 @@ impl TantivyIndex {
             _ => Box::new(BooleanQuery::new(subqueries)),
         };
 
-        let top_docs = searcher.search(&*final_query, &TopDocs::with_limit(top_k))?;
+        let top_docs =
+            searcher.search(&*final_query, &TopDocs::with_limit(top_k).order_by_score())?;
 
         let mut results = Vec::with_capacity(top_docs.len());
         for (score, doc_address) in top_docs {
@@ -758,7 +759,9 @@ mod tests {
         let facet = Facet::from_path(["programming"]);
         let term = Term::from_facet(idx.ts.f_tags, &facet);
         let tq = TermQuery::new(term, IndexRecordOption::Basic);
-        let top_docs = searcher.search(&tq, &TopDocs::with_limit(10)).unwrap();
+        let top_docs = searcher
+            .search(&tq, &TopDocs::with_limit(10).order_by_score())
+            .unwrap();
         assert!(
             !top_docs.is_empty(),
             "direct facet TermQuery should find rust.md"
