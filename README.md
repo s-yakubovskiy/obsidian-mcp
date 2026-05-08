@@ -73,15 +73,15 @@ Semantic daemon release assets are also published per target:
 - `obsidian-semanticd-<version>-<target>.tar.gz` (Unix)
 - `obsidian-semanticd-<version>-<target>.zip` (Windows)
 
-### Edge builds
+### Install from source (edge)
 
-Bleeding-edge binaries are published on every push to `main` as a [rolling GitHub prerelease](https://github.com/lstpsche/obsidian-mcp/releases/tag/edge). These track the latest `main` commit and may be unstable.
-
-If you have the repo cloned, you can install the latest edge build from source:
+If you have the repo cloned, you can install the latest `main` build locally:
 
 ```sh
 ./bin/install-edge
 ```
+
+This pulls the latest `main` and runs `cargo install --path . --features embeddings`.
 
 ## Semantic Runtime Compatibility
 

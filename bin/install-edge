@@ -3,7 +3,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-git pull --ff-only origin main 2>/dev/null || true
+echo "Pulling latest main..."
+if ! git pull --ff-only origin main; then
+  echo "Warning: git pull failed — installing from current local state." >&2
+fi
 
 echo "Installing obsidian-mcp from local source..."
 cargo install --path . --features embeddings
