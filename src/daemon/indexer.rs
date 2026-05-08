@@ -40,10 +40,9 @@ pub(crate) fn embed_note(
     meta: &NoteMetadata,
     model: &EmbeddingModel,
     store: &Arc<RwLock<EmbeddingStore>>,
-    cache_path: &Path,
-) {
+) -> bool {
     let Ok(content) = fs::read_file(vault_root, relative) else {
-        return;
+        return false;
     };
 
     let body = frontmatter::get_body(&content);
@@ -54,10 +53,11 @@ pub(crate) fn embed_note(
         Ok(vector) => match store.write() {
             Ok(mut store_guard) => {
                 store_guard.insert(relative.to_path_buf(), vector);
-                save_embedding_cache(cache_path, &store_guard);
+                true
             }
             Err(err) => {
                 tracing::error!(error = %err, "daemon embedding store lock poisoned");
+                false
             }
         },
         Err(err) => {
@@ -66,23 +66,21 @@ pub(crate) fn embed_note(
                 error = %err,
                 "daemon embedding failed"
             );
+            false
         }
     }
 }
 
 #[cfg(feature = "embeddings")]
-pub(crate) fn remove_note_embedding(
-    relative: &Path,
-    store: &Arc<RwLock<EmbeddingStore>>,
-    cache_path: &Path,
-) {
+pub(crate) fn remove_note_embedding(relative: &Path, store: &Arc<RwLock<EmbeddingStore>>) -> bool {
     match store.write() {
         Ok(mut store_guard) => {
             store_guard.remove(relative);
-            save_embedding_cache(cache_path, &store_guard);
+            true
         }
         Err(err) => {
             tracing::error!(error = %err, "daemon embedding store lock poisoned");
+            false
         }
     }
 }

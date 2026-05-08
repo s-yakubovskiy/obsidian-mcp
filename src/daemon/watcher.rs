@@ -59,16 +59,28 @@ pub fn start_watcher(
         while let Some(result) = rx.recv().await {
             match result {
                 Ok(events) => {
+                    let mut tantivy_dirty = false;
+                    let mut embedding_dirty = false;
                     for event in events {
-                        process_event(
+                        let (tv, emb) = process_event(
                             &vault_root,
                             &index,
                             tantivy.as_deref(),
                             &embedding_model,
                             &embedding_store,
-                            &embedding_cache_path,
                             &event.path,
                         );
+                        tantivy_dirty |= tv;
+                        embedding_dirty |= emb;
+                    }
+                    if tantivy_dirty
+                        && let Some(ref tv) = tantivy
+                        && let Err(err) = tv.flush()
+                    {
+                        tracing::warn!(error = %err, "daemon tantivy batch flush failed");
+                    }
+                    if embedding_dirty && let Ok(store_guard) = embedding_store.read() {
+                        indexer::save_embedding_cache(&embedding_cache_path, &store_guard);
                     }
                 }
                 Err(err) => {
@@ -117,8 +129,16 @@ pub fn start_watcher(
         while let Some(result) = rx.recv().await {
             match result {
                 Ok(events) => {
+                    let mut tantivy_dirty = false;
                     for event in events {
-                        process_event(&vault_root, &index, tantivy.as_deref(), &event.path);
+                        tantivy_dirty |=
+                            process_event(&vault_root, &index, tantivy.as_deref(), &event.path);
+                    }
+                    if tantivy_dirty
+                        && let Some(ref tv) = tantivy
+                        && let Err(err) = tv.flush()
+                    {
+                        tracing::warn!(error = %err, "daemon tantivy batch flush failed");
                     }
                 }
                 Err(err) => {
@@ -143,9 +163,12 @@ fn should_process_path(vault_root: &Path, absolute: &Path) -> bool {
     }
 
     match absolute.extension().and_then(|ext| ext.to_str()) {
-        Some("md") => true,
+        Some(ext) if ext.eq_ignore_ascii_case("md") => true,
         Some(_) => false,
-        None => absolute.to_string_lossy().ends_with(".md"),
+        None => absolute
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .ends_with(".md"),
     }
 }
 
@@ -156,6 +179,7 @@ fn is_obsidian_dir(relative: &Path) -> bool {
         .is_some_and(|component| component.as_os_str() == ".obsidian")
 }
 
+/// Returns `(tantivy_touched, embedding_touched)`.
 #[cfg(feature = "embeddings")]
 fn process_event(
     vault_root: &Path,
@@ -163,96 +187,88 @@ fn process_event(
     tantivy: Option<&TantivyIndex>,
     embedding_model: &EmbeddingModel,
     embedding_store: &Arc<RwLock<EmbeddingStore>>,
-    embedding_cache_path: &Path,
     absolute: &Path,
-) {
+) -> (bool, bool) {
     if !should_process_path(vault_root, absolute) {
-        return;
+        return (false, false);
     }
 
     let relative = match absolute.strip_prefix(vault_root) {
         Ok(relative) => relative.to_path_buf(),
-        Err(_) => return,
+        Err(_) => return (false, false),
     };
+
+    let mut tv_touched = false;
+    let mut emb_touched = false;
 
     if absolute.exists() {
         tracing::debug!(
             path = %relative.display(),
             "daemon watcher reindex (create/modify)"
         );
-        match index.write() {
+        let meta = match index.write() {
             Ok(mut index_guard) => {
                 if let Err(err) = index_guard.reindex_file(vault_root, &relative) {
                     tracing::warn!(path = %relative.display(), error = %err, "daemon reindex failed");
-                    return;
+                    return (false, false);
                 }
-
-                let meta = index_guard.get_note(&relative).cloned();
-                if let Some(tantivy_index) = tantivy
-                    && let Some(ref metadata) = meta
-                    && let Err(err) = tantivy_index.reindex_file(vault_root, &relative, metadata)
-                {
-                    tracing::warn!(
-                        path = %relative.display(),
-                        error = %err,
-                        "daemon tantivy reindex failed"
-                    );
-                }
-
-                if let Some(metadata) = meta.as_ref() {
-                    indexer::embed_note(
-                        vault_root,
-                        &relative,
-                        metadata,
-                        embedding_model,
-                        embedding_store,
-                        embedding_cache_path,
-                    );
-                }
+                index_guard.get_note(&relative).cloned()
             }
             Err(err) => {
                 tracing::error!(error = %err, "daemon index lock poisoned");
+                return (false, false);
             }
+        };
+        if let Some(tv) = tantivy
+            && let Some(ref m) = meta
+        {
+            if let Err(err) = tv.reindex_file_batch(vault_root, &relative, m) {
+                tracing::warn!(path = %relative.display(), error = %err, "daemon tantivy reindex failed");
+            } else {
+                tv_touched = true;
+            }
+        }
+        if let Some(ref m) = meta {
+            emb_touched =
+                indexer::embed_note(vault_root, &relative, m, embedding_model, embedding_store);
         }
     } else {
         tracing::debug!(path = %relative.display(), "daemon watcher remove (delete)");
         match index.write() {
-            Ok(mut index_guard) => {
-                index_guard.remove_file(&relative);
-
-                if let Some(tantivy_index) = tantivy
-                    && let Err(err) = tantivy_index.remove_file(&relative)
-                {
-                    tracing::warn!(
-                        path = %relative.display(),
-                        error = %err,
-                        "daemon tantivy remove failed"
-                    );
-                }
-
-                indexer::remove_note_embedding(&relative, embedding_store, embedding_cache_path);
-            }
+            Ok(mut index_guard) => index_guard.remove_file(&relative),
             Err(err) => {
                 tracing::error!(error = %err, "daemon index lock poisoned");
+                return (false, false);
             }
         }
+        if let Some(tv) = tantivy {
+            if let Err(err) = tv.remove_file_batch(&relative) {
+                tracing::warn!(path = %relative.display(), error = %err, "daemon tantivy remove failed");
+            } else {
+                tv_touched = true;
+            }
+        }
+        emb_touched = indexer::remove_note_embedding(&relative, embedding_store);
     }
+
+    (tv_touched, emb_touched)
 }
 
+/// Returns whether Tantivy was touched.
 #[cfg(not(feature = "embeddings"))]
 fn process_event(
     vault_root: &Path,
     index: &Arc<RwLock<VaultIndex>>,
     tantivy: Option<&TantivyIndex>,
     absolute: &Path,
-) {
+) -> bool {
     if !should_process_path(vault_root, absolute) {
-        return;
+        return false;
     }
 
     let relative = match absolute.strip_prefix(vault_root) {
         Ok(relative) => relative.to_path_buf(),
-        Err(_) => return,
+        Err(_) => return false,
     };
 
     if absolute.exists() {
@@ -260,47 +276,45 @@ fn process_event(
             path = %relative.display(),
             "daemon watcher reindex (create/modify)"
         );
-        match index.write() {
+        let meta = match index.write() {
             Ok(mut index_guard) => {
                 if let Err(err) = index_guard.reindex_file(vault_root, &relative) {
                     tracing::warn!(path = %relative.display(), error = %err, "daemon reindex failed");
-                    return;
+                    return false;
                 }
-
-                if let Some(tantivy_index) = tantivy
-                    && let Some(meta) = index_guard.get_note(&relative)
-                    && let Err(err) = tantivy_index.reindex_file(vault_root, &relative, meta)
-                {
-                    tracing::warn!(
-                        path = %relative.display(),
-                        error = %err,
-                        "daemon tantivy reindex failed"
-                    );
-                }
+                index_guard.get_note(&relative).cloned()
             }
             Err(err) => {
                 tracing::error!(error = %err, "daemon index lock poisoned");
+                return false;
             }
+        };
+        if let Some(tv) = tantivy
+            && let Some(ref m) = meta
+        {
+            if let Err(err) = tv.reindex_file_batch(vault_root, &relative, m) {
+                tracing::warn!(path = %relative.display(), error = %err, "daemon tantivy reindex failed");
+                return false;
+            }
+            return true;
         }
+        false
     } else {
         tracing::debug!(path = %relative.display(), "daemon watcher remove (delete)");
         match index.write() {
-            Ok(mut index_guard) => {
-                index_guard.remove_file(&relative);
-
-                if let Some(tantivy_index) = tantivy
-                    && let Err(err) = tantivy_index.remove_file(&relative)
-                {
-                    tracing::warn!(
-                        path = %relative.display(),
-                        error = %err,
-                        "daemon tantivy remove failed"
-                    );
-                }
-            }
+            Ok(mut index_guard) => index_guard.remove_file(&relative),
             Err(err) => {
                 tracing::error!(error = %err, "daemon index lock poisoned");
+                return false;
             }
         }
+        if let Some(tv) = tantivy {
+            if let Err(err) = tv.remove_file_batch(&relative) {
+                tracing::warn!(path = %relative.display(), error = %err, "daemon tantivy remove failed");
+                return false;
+            }
+            return true;
+        }
+        false
     }
 }

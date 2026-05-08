@@ -176,7 +176,7 @@ fn should_process_path(vault_root: &Path, absolute: &Path) -> bool {
     }
 
     match absolute.extension().and_then(|e| e.to_str()) {
-        Some("md") => true,
+        Some(ext) if ext.eq_ignore_ascii_case("md") => true,
         Some(ext) => {
             tracing::trace!(path = %relative.display(), ext, "non-markdown file, ignoring");
             false
@@ -190,7 +190,7 @@ fn should_process_path(vault_root: &Path, absolute: &Path) -> bool {
             // those, so we check if the path *looks* like it had an `.md` extension
             // by inspecting the string directly.
             let path_str = absolute.to_string_lossy();
-            if path_str.ends_with(".md") {
+            if path_str.to_ascii_lowercase().ends_with(".md") {
                 true
             } else {
                 tracing::trace!(path = %relative.display(), "no extension, ignoring");
@@ -431,6 +431,14 @@ mod tests {
             &root,
             &root.join("subfolder/deep/note.md")
         ));
+    }
+
+    #[test]
+    fn accepts_uppercase_markdown_extension() {
+        let root = vault();
+        assert!(should_process_path(&root, &root.join("NOTE.MD")));
+        assert!(should_process_path(&root, &root.join("Mixed.Md")));
+        assert!(should_process_path(&root, &root.join("subfolder/CAPS.MD")));
     }
 
     #[test]
