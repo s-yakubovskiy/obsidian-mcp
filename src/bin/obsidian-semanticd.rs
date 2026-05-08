@@ -6,6 +6,10 @@ use obsidian_mcp::daemon::server::{self, DaemonServerConfig, IpcEndpoint};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(code) = handle_cli_flags() {
+        std::process::exit(code);
+    }
+
     let log_level = std::env::var("OBSIDIAN_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(log_level))
@@ -34,6 +38,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     server::run(config).await?;
     Ok(())
+}
+
+fn handle_cli_flags() -> Option<i32> {
+    let arg = std::env::args().nth(1)?;
+    match arg.as_str() {
+        "--version" | "-v" => {
+            println!("obsidian-semanticd {}", env!("CARGO_PKG_VERSION"));
+            Some(0)
+        }
+        "--help" | "-h" | "help" => {
+            println!(
+                "obsidian-semanticd {version} — semantic search daemon for obsidian-mcp\n\
+                 \n\
+                 USAGE:\n    \
+                     obsidian-semanticd\n\
+                 \n\
+                 OPTIONS:\n    \
+                     -h, --help       Print this help message\n    \
+                     -v, --version    Print version\n\
+                 \n\
+                 ENVIRONMENT VARIABLES:\n    \
+                     OBSIDIAN_LOG_LEVEL          Tracing log level           [default: info]\n    \
+                     OBSIDIAN_SEMANTIC_HOME      Override semantic home dir\n    \
+                     OBSIDIAN_SEMANTIC_ENDPOINT  Override IPC endpoint\n    \
+                     OBSIDIAN_SEMANTIC_MODEL     Embedding model name        [default: {model}]",
+                version = env!("CARGO_PKG_VERSION"),
+                model = DEFAULT_MODEL_NAME,
+            );
+            Some(0)
+        }
+        _ => None,
+    }
 }
 
 fn resolve_endpoint_from_env() -> Option<IpcEndpoint> {

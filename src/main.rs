@@ -17,6 +17,10 @@ const DAEMON_DISABLED_BY_WATCH_REASON: &str =
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(code) = handle_cli_flags() {
+        std::process::exit(code);
+    }
+
     let config = Config::load()?;
     let semantic_runtime_config = SemanticRuntimeConfig::load_from_env();
 
@@ -167,6 +171,44 @@ async fn initialize_daemon_client(
         "semantic daemon connection established"
     );
     Ok(initialized)
+}
+
+fn handle_cli_flags() -> Option<i32> {
+    let arg = std::env::args().nth(1)?;
+    match arg.as_str() {
+        "--version" | "-v" => {
+            println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+            Some(0)
+        }
+        "--help" | "-h" | "help" => {
+            println!(
+                "{name} {version} — {description}\n\
+                 \n\
+                 USAGE:\n    \
+                     {name} [VAULT_PATH]\n\
+                 \n\
+                 ARGUMENTS:\n    \
+                     VAULT_PATH    Path to Obsidian vault (or set OBSIDIAN_VAULT_PATH)\n\
+                 \n\
+                 OPTIONS:\n    \
+                     -h, --help       Print this help message\n    \
+                     -v, --version    Print version\n\
+                 \n\
+                 ENVIRONMENT VARIABLES:\n    \
+                     OBSIDIAN_VAULT_PATH     Vault root (required if not passed as argument)\n    \
+                     OBSIDIAN_WATCH          Enable filesystem watcher       [default: true]\n    \
+                     OBSIDIAN_LOG_LEVEL      Tracing log level               [default: info]\n    \
+                     OBSIDIAN_TANTIVY        Enable BM25 full-text index     [default: true]\n    \
+                     OBSIDIAN_EMBEDDINGS     Enable semantic embeddings      [default: false]\n    \
+                     OBSIDIAN_HYBRID_ALPHA   BM25/semantic blend weight      [default: 0.25]",
+                name = env!("CARGO_PKG_NAME"),
+                version = env!("CARGO_PKG_VERSION"),
+                description = env!("CARGO_PKG_DESCRIPTION"),
+            );
+            Some(0)
+        }
+        _ => None,
+    }
 }
 
 fn endpoint_from_override(raw: &str) -> IpcEndpoint {
