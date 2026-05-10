@@ -53,7 +53,8 @@ obsidian-mcp binary
 
 | Component | Crate | Purpose |
 |-----------|-------|---------|
-| MCP protocol | `rmcp` 1.2 | Server, tools, stdio transport |
+| MCP protocol | `rmcp` 1.6 | Server, tools, stdio + Streamable HTTP transport |
+| HTTP framework | `axum` 0.8 | HTTP routing for Streamable HTTP transport |
 | Async runtime | `tokio` 1 | async/await, tasks, IO |
 | Serialization | `serde`, `serde_json`, `yaml_serde` 0.10 | JSON + YAML frontmatter |
 | JSON Schema | `schemars` 1.0 | Auto-generate schemas for tool params |
@@ -214,6 +215,9 @@ npx @modelcontextprotocol/inspector cargo run
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `OBSIDIAN_VAULT_PATH` | Yes | — | Absolute path to Obsidian vault root |
+| `OBSIDIAN_TRANSPORT` | No | `stdio` | Transport: `stdio` or `http` |
+| `OBSIDIAN_HTTP_PORT` | No | `37842` | HTTP listen port (only used with `http` transport) |
+| `OBSIDIAN_HTTP_HOST` | No | `127.0.0.1` | HTTP bind address (only used with `http` transport) |
 | `OBSIDIAN_WATCH` | No | `true` | Enable filesystem watcher |
 | `OBSIDIAN_LOG_LEVEL` | No | `info` | Tracing log level |
 | `OBSIDIAN_TANTIVY` | No | `true` | Enable Tantivy BM25 full-text index |
@@ -333,6 +337,12 @@ The full development plan with task breakdown, dependencies, and parallelization
 - **CI cargo-audit:** The CI pipeline runs `cargo audit` on Ubuntu to detect known vulnerabilities in dependencies automatically. Transitive-dep advisories that cannot be fixed without major upgrades are suppressed in `.cargo/audit.toml` with comments explaining the risk assessment. Update this file when dependencies are upgraded.
 - **CLI flags:** Both binaries support `--version`/`-v` and `--help`/`-h`/`help`. Flags are handled by a `handle_cli_flags()` function at the top of `main()`, before `Config::load()` or tracing init, printing to stdout and calling `std::process::exit(0)`. No CLI framework needed — manual `match` on `std::env::args().nth(1)`.
 - **reqwest 0.13 TLS feature rename:** The `rustls-tls` feature was renamed to `rustls` in reqwest 0.13. If reverting reqwest, update the Cargo.toml feature name back.
+- **Dual transport (stdio + Streamable HTTP):** The binary supports both stdio (default) and Streamable HTTP transports. Select via `--http` CLI flag or `OBSIDIAN_TRANSPORT=http` env var. HTTP mode uses rmcp's `StreamableHttpService` (tower-compatible) served by axum. `StreamableHttpServerConfig` is `#[non_exhaustive]` — use `Default::default()` + field mutation, not struct literals.
+- **HTTP transport config:** `stateful_mode: true` (sessions per MCP Initialize handshake) and `json_response: true` (plain JSON for request-response, no SSE overhead). Each session gets its own `ObsidianMcp` instance via the factory closure, but all share the same `Vault` (Arc-based, thread-safe).
+- **`serve` subcommand daemonization:** `obsidian-mcp serve` spawns a detached child process with `--http` and the same args, then the parent exits immediately. The child's stderr is redirected to a platform-specific log file (macOS: `~/Library/Logs/obsidian-mcp.log`, Linux: `$XDG_STATE_HOME/obsidian-mcp/obsidian-mcp.log`, Windows: `%LOCALAPPDATA%/obsidian-mcp/obsidian-mcp.log`). On Unix, `process_group(0)` detaches the child from the parent's terminal. The parent waits 150ms and checks `try_wait()` to detect immediate child failures before reporting success. No PID file — use OS process management (launchd, systemd) for production daemon setups.
+- **`/health` endpoint:** HTTP mode exposes `GET /health` returning `{"status":"ok","server":"obsidian-mcp","version":"..."}`. MCP tools are served under `/mcp`.
+- **Graceful HTTP shutdown:** The HTTP server handles both SIGTERM (Unix) and Ctrl+C for clean shutdown. On non-Unix platforms, only Ctrl+C is supported.
+- **rmcp 1.6 upgrade:** Bumped from 1.2 to 1.6. No breaking changes to our code. Key additions: Origin/Host validation for HTTP, runtime tool disabling, session store for resumability, init_timeout for streamable-http sessions.
 
 ## Links
 

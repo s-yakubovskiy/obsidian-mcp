@@ -1,20 +1,34 @@
 //! Configuration: env/CLI config for vault path, watch toggle, log level,
-//! and optional search features (Tantivy BM25, embeddings).
+//! transport selection, and optional search features (Tantivy BM25, embeddings).
 
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 
 pub const DEFAULT_MODEL_NAME: &str = "BAAI/bge-small-en-v1.5";
+pub const DEFAULT_HTTP_PORT: u16 = 37842;
+pub const DEFAULT_HTTP_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
 const DEFAULT_HYBRID_ALPHA: f32 = 0.25;
 const DEFAULT_SEMANTIC_CONNECT_TIMEOUT_MS: u64 = 2_000;
 const DEFAULT_SEMANTIC_CONNECT_RETRIES: u32 = 2;
 const DEFAULT_SEMANTIC_RETRY_BACKOFF_MS: u64 = 250;
 const DEFAULT_SEMANTIC_PREFETCH_COUNT: usize = 50;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Transport {
+    #[default]
+    Stdio,
+    Http,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub vault_path: PathBuf,
     pub watch: bool,
     pub log_level: String,
+    pub transport: Transport,
+    pub http_host: IpAddr,
+    pub http_port: u16,
     /// Enable Tantivy BM25 full-text index (`OBSIDIAN_TANTIVY`, default `true`).
     pub tantivy: bool,
     /// Enable semantic embedding search (`OBSIDIAN_EMBEDDINGS`, default `false`).
@@ -26,18 +40,84 @@ pub struct Config {
     pub hybrid_alpha: f32,
 }
 
+/// Parsed CLI arguments split into flags/values and positional args.
+#[derive(Debug, Default)]
+pub struct CliArgs {
+    pub http: bool,
+    pub port: Option<u16>,
+    pub host: Option<IpAddr>,
+    pub vault_path: Option<PathBuf>,
+}
+
+/// Parse CLI args after the binary name, ignoring --help/--version (handled earlier).
+pub fn parse_cli_args() -> CliArgs {
+    let mut result = CliArgs::default();
+    let mut args = std::env::args().skip(1);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--http" => result.http = true,
+            "--port" => {
+                if let Some(val) = args.next() {
+                    result.port = val.parse().ok();
+                }
+            }
+            "--host" => {
+                if let Some(val) = args.next() {
+                    result.host = val.parse().ok();
+                }
+            }
+            s if s.starts_with('-') => {}
+            _ => {
+                if result.vault_path.is_none() {
+                    result.vault_path = Some(normalize_vault_path(&arg));
+                }
+            }
+        }
+    }
+    result
+}
+
 impl Config {
     /// Load configuration from CLI args and environment variables.
     ///
-    /// Priority for vault path: CLI arg (first positional) > `OBSIDIAN_VAULT_PATH` env var.
-    pub fn load() -> Result<Self, String> {
-        let vault_path = std::env::args()
-            .nth(1)
-            .or_else(|| std::env::var("OBSIDIAN_VAULT_PATH").ok())
-            .map(|raw| normalize_vault_path(&raw))
+    /// Priority for vault path: CLI positional arg > `OBSIDIAN_VAULT_PATH` env var.
+    /// Priority for transport: `--http` flag > `OBSIDIAN_TRANSPORT` env var > default (stdio).
+    pub fn load(cli: &CliArgs) -> Result<Self, String> {
+        let vault_path = cli
+            .vault_path
+            .clone()
+            .or_else(|| {
+                std::env::var("OBSIDIAN_VAULT_PATH")
+                    .ok()
+                    .map(|raw| normalize_vault_path(&raw))
+            })
             .ok_or_else(|| {
                 "Vault path required: pass as first argument or set OBSIDIAN_VAULT_PATH".to_string()
             })?;
+
+        let transport = if cli.http {
+            Transport::Http
+        } else {
+            match std::env::var("OBSIDIAN_TRANSPORT").ok().as_deref() {
+                Some(v) if v.eq_ignore_ascii_case("http") => Transport::Http,
+                _ => Transport::Stdio,
+            }
+        };
+
+        let http_port = cli
+            .port
+            .or_else(|| parse_u16_env("OBSIDIAN_HTTP_PORT"))
+            .unwrap_or(DEFAULT_HTTP_PORT);
+
+        let http_host = cli
+            .host
+            .or_else(|| {
+                std::env::var("OBSIDIAN_HTTP_HOST")
+                    .ok()
+                    .and_then(|v| v.trim().parse().ok())
+            })
+            .unwrap_or(DEFAULT_HTTP_HOST);
 
         let watch = std::env::var("OBSIDIAN_WATCH")
             .unwrap_or_else(|_| "true".into())
@@ -67,6 +147,9 @@ impl Config {
             vault_path,
             watch,
             log_level,
+            transport,
+            http_host,
+            http_port,
             tantivy,
             embeddings,
             embeddings_model,
@@ -198,6 +281,10 @@ fn parse_u64_env(var_name: &str) -> Option<u64> {
 
 fn parse_u32_env(var_name: &str) -> Option<u32> {
     std::env::var(var_name).ok()?.trim().parse::<u32>().ok()
+}
+
+fn parse_u16_env(var_name: &str) -> Option<u16> {
+    std::env::var(var_name).ok()?.trim().parse::<u16>().ok()
 }
 
 fn parse_usize_env(var_name: &str) -> Option<usize> {

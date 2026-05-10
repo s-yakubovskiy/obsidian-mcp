@@ -20,8 +20,11 @@ obsidian-mcp talks directly to the filesystem. It understands the Obsidian forma
 # Install
 cargo install obsidian-mcp
 
-# Run
+# Run (stdio — for MCP clients that launch the process)
 obsidian-mcp /path/to/your/vault
+
+# Run (HTTP — shared server for multiple agents)
+obsidian-mcp --http /path/to/your/vault
 ```
 
 Add to your MCP client config (Cursor, Claude Desktop, etc.) and you're done — 29 tools are available immediately.
@@ -102,9 +105,60 @@ Upgrade guidance:
 - Prefer upgrading `obsidian-mcp`, `obsidian-semanticd`, and `obsidian-semantic-search-plugin` together.
 - If versions are skewed, startup/handshake fails with explicit API incompatibility errors rather than silent fallback.
 
+## Transport Modes
+
+obsidian-mcp supports two transports. Both are always compiled in — choose the one that fits your workflow.
+
+### stdio (default)
+
+The standard MCP transport. The AI client spawns the process and communicates over stdin/stdout.
+
+**Use when:** your MCP client manages the server process (Cursor, Claude Desktop, most MCP clients).
+
+```sh
+obsidian-mcp /path/to/vault
+```
+
+Each client connection spawns its own process. Simple, zero-config, works everywhere.
+
+### Streamable HTTP
+
+A persistent HTTP server that multiple clients can connect to simultaneously.
+
+**Use when:** you run multiple headless agents (`cursor agent -p`, parallel Claude sessions, etc.) against the same vault and want to share a single server process instead of spawning one per agent.
+
+```sh
+# Foreground (for development / process managers)
+obsidian-mcp --http /path/to/vault
+
+# Background (daemonize — spawns child, parent exits)
+obsidian-mcp serve /path/to/vault
+```
+
+The `serve` command daemonizes the server and redirects logs to a platform-specific file:
+- **macOS:** `~/Library/Logs/obsidian-mcp.log`
+- **Linux:** `$XDG_STATE_HOME/obsidian-mcp/obsidian-mcp.log`
+- **Windows:** `%LOCALAPPDATA%/obsidian-mcp/obsidian-mcp.log`
+
+Default: `http://127.0.0.1:37842`. MCP tools are served at `/mcp`, health check at `/health`.
+
+Benefits over stdio for multi-agent setups:
+- **Shared index** — one in-memory BM25/embedding index instead of N copies
+- **Lower resource usage** — single filesystem watcher, single process
+- **Process independence** — server stays up when agents come and go
+- **Standard observability** — HTTP health checks, logging, standard networking
+
+Configure the address:
+
+```sh
+obsidian-mcp --http --port 9000 --host 0.0.0.0 /path/to/vault
+# or via env vars
+OBSIDIAN_TRANSPORT=http OBSIDIAN_HTTP_PORT=9000 obsidian-mcp /path/to/vault
+```
+
 ## Client Setup
 
-### Cursor
+### Cursor (stdio)
 
 `~/.cursor/mcp.json`:
 
@@ -118,6 +172,28 @@ Upgrade guidance:
   }
 }
 ```
+
+### Cursor (HTTP — shared server)
+
+Start the server once:
+
+```sh
+obsidian-mcp serve /path/to/your/vault
+```
+
+Then point Cursor at it:
+
+```json
+{
+  "mcpServers": {
+    "obsidian": {
+      "url": "http://127.0.0.1:37842/mcp"
+    }
+  }
+}
+```
+
+All Cursor agents (IDE, CLI, headless) share the same server.
 
 ### Claude Desktop
 
@@ -141,7 +217,7 @@ Config file location:
 
 ### Any MCP client
 
-obsidian-mcp communicates over **stdio** using the standard MCP JSON-RPC protocol. Any client that supports MCP stdio transport will work. Pass the vault path as the first argument or via `OBSIDIAN_VAULT_PATH`.
+obsidian-mcp supports both **stdio** and **Streamable HTTP** MCP transports. Any MCP-compatible client can connect via either method. Pass the vault path as the first argument or via `OBSIDIAN_VAULT_PATH`.
 
 ## Search
 
@@ -268,6 +344,9 @@ Always available. Full regex syntax for pattern matching across all notes.
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `OBSIDIAN_VAULT_PATH` | Yes* | — | Absolute path to your Obsidian vault |
+| `OBSIDIAN_TRANSPORT` | No | `stdio` | Transport mode: `stdio` or `http` |
+| `OBSIDIAN_HTTP_PORT` | No | `37842` | HTTP listen port |
+| `OBSIDIAN_HTTP_HOST` | No | `127.0.0.1` | HTTP bind address |
 | `OBSIDIAN_WATCH` | No | `true` | Filesystem watcher for live index updates |
 | `OBSIDIAN_LOG_LEVEL` | No | `info` | `trace`, `debug`, `info`, `warn`, `error` |
 | `OBSIDIAN_TANTIVY` | No | `true` | BM25 full-text index |
@@ -292,8 +371,12 @@ Always available. Full regex syntax for pattern matching across all notes.
 ## Architecture
 
 ```
-AI Client (Cursor, Claude Desktop, etc.)
- │ stdio (MCP JSON-RPC)
+AI Client(s)
+ │
+ ├─ stdio (1:1 process)       ←  default, single-client
+ │     OR
+ ├─ HTTP POST /mcp (N:1)      ←  shared server, multi-client
+ │
  ▼
 obsidian-mcp
  ├─ tools/          MCP handlers — translate protocol into vault ops
@@ -311,18 +394,23 @@ Vault directory (.md files + .obsidian/)
 
 The vault layer is a pure Rust library with no knowledge of MCP. The tools layer is a thin adapter. This separation means the vault code is independently testable and reusable.
 
+In HTTP mode, each MCP session gets its own handler instance, but all sessions share a single `Vault` (thread-safe via `Arc<RwLock<...>>`). One filesystem watcher, one BM25 index, one embedding store — regardless of how many agents are connected.
+
 ## Development
 
 ```sh
 cargo build                          # default build
 cargo build --features embeddings    # with semantic search
 
+# stdio mode (default)
 OBSIDIAN_VAULT_PATH=~/vault cargo run
-OBSIDIAN_VAULT_PATH=~/vault OBSIDIAN_EMBEDDINGS=true cargo run --features embeddings
+
+# HTTP mode
+OBSIDIAN_VAULT_PATH=~/vault cargo run -- --http
 
 cargo fmt --check && cargo clippy && cargo test
 
-npx @modelcontextprotocol/inspector cargo run   # interactive testing
+npx @modelcontextprotocol/inspector cargo run   # interactive testing (stdio)
 ```
 
 ## License
