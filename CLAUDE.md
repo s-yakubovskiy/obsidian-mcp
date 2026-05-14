@@ -181,7 +181,8 @@ impl ServerHandler for ObsidianMcp {
 ### Error handling
 - All vault operations return `VaultResult<T>` (alias for `Result<T, VaultError>`)
 - `VaultError` variants are descriptive (include the path, the target, etc.)
-- MCP tools convert to `rmcp::ErrorData` at the boundary
+- MCP tools convert vault errors to `rmcp::ErrorData` at the boundary via `?`
+- Tool-layer parameter validation (invalid action/query/view, missing required param) uses `ErrorData::new(ErrorCode::INVALID_PARAMS, ...)` directly — not `VaultError::Other` which maps to `INTERNAL_ERROR`
 
 ### Naming
 - MCP tool names: `snake_case` (e.g., `vault_list`, `note_read`, `search_text`)
