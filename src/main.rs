@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 #[cfg(any(unix, test))]
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -8,13 +9,17 @@ use tracing_subscriber::EnvFilter;
 
 use obsidian_mcp::client::semantic_daemon::{DaemonConnectPolicy, SemanticDaemonClient};
 use obsidian_mcp::config::{
-    Config, SemanticMode, SemanticRuntimeConfig, Transport, parse_cli_args,
+    Config, SemanticMode, SemanticRuntimeConfig, ToolFilter, Transport, parse_cli_args,
 };
 use obsidian_mcp::daemon::bootstrap::{BootstrapConfig, ensure_daemon};
 use obsidian_mcp::daemon::server::IpcEndpoint;
 use obsidian_mcp::error::VaultError;
 use obsidian_mcp::tools::{ObsidianMcp, SemanticRuntime};
 use obsidian_mcp::vault::Vault;
+
+tokio::task_local! {
+    static SESSION_DISABLED_TOOLS: HashSet<String>;
+}
 
 const DAEMON_DISABLED_BY_WATCH_REASON: &str =
     "semantic daemon disabled because OBSIDIAN_WATCH is false";
@@ -48,16 +53,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let vault = Vault::open(&config).await?;
+    let disabled_tools = config.tool_filter.disabled_tools();
 
     match config.transport {
         Transport::Stdio => {
-            let server = ObsidianMcp::new(vault, config.hybrid_alpha, semantic_runtime)
-                .serve(rmcp::transport::io::stdio())
-                .await?;
+            let server =
+                ObsidianMcp::new(vault, config.hybrid_alpha, semantic_runtime, disabled_tools)
+                    .serve(rmcp::transport::io::stdio())
+                    .await?;
             server.waiting().await?;
         }
         Transport::Http => {
-            serve_http(vault, config.hybrid_alpha, semantic_runtime, &config).await?;
+            serve_http(
+                vault,
+                config.hybrid_alpha,
+                semantic_runtime,
+                disabled_tools,
+                &config,
+            )
+            .await?;
         }
     }
 
@@ -68,9 +82,10 @@ async fn serve_http(
     vault: Vault,
     hybrid_alpha: f32,
     semantic_runtime: SemanticRuntime,
+    server_disabled: HashSet<String>,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use axum::{Router, routing::get};
+    use axum::{Router, middleware, routing::get};
     use rmcp::transport::StreamableHttpServerConfig;
     use rmcp::transport::streamable_http_server::{
         session::local::LocalSessionManager, tower::StreamableHttpService,
@@ -83,19 +98,30 @@ async fn serve_http(
     let mcp_service: StreamableHttpService<ObsidianMcp, LocalSessionManager> =
         StreamableHttpService::new(
             move || {
+                let mut disabled = server_disabled.clone();
+                SESSION_DISABLED_TOOLS
+                    .try_with(|extra| {
+                        disabled.extend(extra.iter().cloned());
+                    })
+                    .ok();
                 Ok(ObsidianMcp::new(
                     vault.clone(),
                     hybrid_alpha,
                     semantic_runtime.clone(),
+                    disabled,
                 ))
             },
             Arc::new(LocalSessionManager::default()),
             mcp_config,
         );
 
+    let mcp_router = Router::new()
+        .nest_service("/mcp", mcp_service)
+        .layer(middleware::from_fn(tool_filter_middleware));
+
     let app = Router::new()
         .route("/health", get(health_handler))
-        .nest_service("/mcp", mcp_service);
+        .merge(mcp_router);
 
     let addr = std::net::SocketAddr::new(config.http_host, config.http_port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -106,6 +132,31 @@ async fn serve_http(
         .await?;
 
     Ok(())
+}
+
+async fn tool_filter_middleware(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let session_disabled = request
+        .headers()
+        .get("X-Obsidian-Tools")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|raw| match ToolFilter::parse(raw) {
+            Ok(filter) => Some(filter.disabled_tools()),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "invalid X-Obsidian-Tools header, using server default"
+                );
+                None
+            }
+        })
+        .unwrap_or_default();
+
+    SESSION_DISABLED_TOOLS
+        .scope(session_disabled, next.run(request))
+        .await
 }
 
 async fn health_handler() -> axum::Json<serde_json::Value> {
@@ -323,7 +374,9 @@ fn print_help() {
              OBSIDIAN_LOG_LEVEL      Tracing log level              [default: info]\n    \
              OBSIDIAN_TANTIVY        Enable BM25 full-text index    [default: true]\n    \
              OBSIDIAN_EMBEDDINGS     Enable semantic embeddings     [default: false]\n    \
-             OBSIDIAN_HYBRID_ALPHA   BM25/semantic blend weight     [default: 0.25]",
+             OBSIDIAN_HYBRID_ALPHA   BM25/semantic blend weight     [default: 0.25]\n    \
+             OBSIDIAN_TOOLS          Tool filter: profile (full/core/read/minimal),\n    \
+                                     comma-separated allow-list, or !-prefixed deny-list",
         name = env!("CARGO_PKG_NAME"),
         version = env!("CARGO_PKG_VERSION"),
         description = env!("CARGO_PKG_DESCRIPTION"),

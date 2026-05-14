@@ -8,6 +8,7 @@ pub mod periodic;
 pub mod search;
 pub mod utility;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -39,9 +40,24 @@ pub struct ObsidianMcp {
 
 #[tool_router]
 impl ObsidianMcp {
-    pub fn new(vault: Vault, hybrid_alpha: f32, semantic_runtime: SemanticRuntime) -> Self {
+    pub fn new(
+        vault: Vault,
+        hybrid_alpha: f32,
+        semantic_runtime: SemanticRuntime,
+        disabled_tools: HashSet<String>,
+    ) -> Self {
+        let mut tool_router = Self::tool_router();
+        if !disabled_tools.is_empty() {
+            tracing::info!(
+                count = disabled_tools.len(),
+                "disabling tools per filter config"
+            );
+            for name in disabled_tools {
+                tool_router.disable_route(name);
+            }
+        }
         Self {
-            tool_router: Self::tool_router(),
+            tool_router,
             vault,
             hybrid_alpha,
             semantic_runtime,
@@ -284,5 +300,76 @@ impl ServerHandler for ObsidianMcp {
                 "Obsidian vault MCP server. Provides tools to read, write, search, \
                  and navigate your Obsidian notes via direct filesystem access.",
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ALL_TOOL_NAMES;
+    use crate::test_helpers::{create_test_vault, test_config};
+    use crate::vault::Vault;
+
+    fn test_runtime() -> SemanticRuntime {
+        SemanticRuntime {
+            mode: SemanticMode::Local,
+            daemon_client: None,
+            daemon_unavailable_reason: None,
+            prefetch_count: 50,
+            vault_ensured: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[tokio::test]
+    async fn no_disabled_tools_exposes_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_test_vault(tmp.path());
+        let vault = Vault::open(&test_config(tmp.path())).await.unwrap();
+        let server = ObsidianMcp::new(vault, 0.25, test_runtime(), HashSet::new());
+
+        for name in ALL_TOOL_NAMES {
+            assert!(
+                server.tool_router.has_route(name),
+                "expected tool '{name}' to be enabled"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_tools_are_hidden() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_test_vault(tmp.path());
+        let vault = Vault::open(&test_config(tmp.path())).await.unwrap();
+
+        let disabled: HashSet<String> = ["open_in_obsidian", "wikilinks", "periodic"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let server = ObsidianMcp::new(vault, 0.25, test_runtime(), disabled);
+
+        assert!(!server.tool_router.has_route("open_in_obsidian"));
+        assert!(!server.tool_router.has_route("wikilinks"));
+        assert!(!server.tool_router.has_route("periodic"));
+
+        assert!(server.tool_router.has_route("note_read"));
+        assert!(server.tool_router.has_route("vault_list"));
+        assert!(server.tool_router.has_route("search_text"));
+    }
+
+    #[tokio::test]
+    async fn disable_all_tools_hides_everything() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_test_vault(tmp.path());
+        let vault = Vault::open(&test_config(tmp.path())).await.unwrap();
+
+        let disabled: HashSet<String> = ALL_TOOL_NAMES.iter().map(|s| s.to_string()).collect();
+        let server = ObsidianMcp::new(vault, 0.25, test_runtime(), disabled);
+
+        for name in ALL_TOOL_NAMES {
+            assert!(
+                !server.tool_router.has_route(name),
+                "expected tool '{name}' to be disabled"
+            );
+        }
     }
 }
