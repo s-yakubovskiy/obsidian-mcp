@@ -35,7 +35,7 @@ pub struct ObsidianMcp {
     hybrid_alpha: f32,
     semantic_runtime: SemanticRuntime,
     #[allow(dead_code)]
-    tool_router: ToolRouter<Self>,
+    pub tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]

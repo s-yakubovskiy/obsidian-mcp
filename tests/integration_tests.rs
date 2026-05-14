@@ -635,6 +635,172 @@ mod vault_periodic {
     }
 }
 
+// ── Tool filtering (integration) ─────────────────────────────────────────
+
+mod tool_filtering {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use obsidian_mcp::config::{ALL_TOOL_NAMES, SemanticMode};
+    use obsidian_mcp::tools::{ObsidianMcp, SemanticRuntime};
+
+    use super::*;
+
+    fn test_runtime() -> SemanticRuntime {
+        SemanticRuntime {
+            mode: SemanticMode::Local,
+            daemon_client: None,
+            daemon_unavailable_reason: None,
+            prefetch_count: 50,
+            vault_ensured: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn filtering_config(vault_root: &Path, filter: ToolFilter) -> Config {
+        Config {
+            vault_path: vault_root.to_path_buf(),
+            watch: false,
+            log_level: "error".into(),
+            transport: obsidian_mcp::config::Transport::Stdio,
+            http_host: obsidian_mcp::config::DEFAULT_HTTP_HOST,
+            http_port: obsidian_mcp::config::DEFAULT_HTTP_PORT,
+            tantivy: false,
+            embeddings: false,
+            embeddings_model: String::new(),
+            hybrid_alpha: 0.25,
+            tool_filter: filter,
+        }
+    }
+
+    async fn build_server(filter: ToolFilter) -> (tempfile::TempDir, ObsidianMcp) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".obsidian")).unwrap();
+        let config = filtering_config(tmp.path(), filter);
+        let disabled = config.tool_filter.disabled_tools();
+        let vault = Vault::open(&config).await.expect("open vault");
+        let server = ObsidianMcp::new(vault, 0.25, test_runtime(), disabled);
+        (tmp, server)
+    }
+
+    #[tokio::test]
+    async fn full_profile_exposes_all_18_tools() {
+        let (_tmp, server) = build_server(ToolFilter::Full).await;
+        let tools = server.tool_router.list_all();
+        assert_eq!(
+            tools.len(),
+            ALL_TOOL_NAMES.len(),
+            "full profile should expose all {} tools, got {}",
+            ALL_TOOL_NAMES.len(),
+            tools.len()
+        );
+        for name in ALL_TOOL_NAMES {
+            assert!(
+                server.tool_router.has_route(name),
+                "full profile should include '{name}'"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn core_profile_exposes_14_tools() {
+        let (_tmp, server) = build_server(ToolFilter::Profile("core".into())).await;
+        let tools = server.tool_router.list_all();
+        assert_eq!(tools.len(), 14, "core profile should expose 14 tools");
+
+        assert!(server.tool_router.has_route("note_read"));
+        assert!(server.tool_router.has_route("vault_list"));
+        assert!(server.tool_router.has_route("search_text"));
+        assert!(server.tool_router.has_route("frontmatter"));
+        assert!(server.tool_router.has_route("note_inspect"));
+
+        assert!(!server.tool_router.has_route("search_semantic"));
+        assert!(!server.tool_router.has_route("wikilinks"));
+        assert!(!server.tool_router.has_route("periodic"));
+        assert!(!server.tool_router.has_route("open_in_obsidian"));
+    }
+
+    #[tokio::test]
+    async fn read_profile_exposes_10_tools() {
+        let (_tmp, server) = build_server(ToolFilter::Profile("read".into())).await;
+        let tools = server.tool_router.list_all();
+        assert_eq!(tools.len(), 10, "read profile should expose 10 tools");
+
+        assert!(server.tool_router.has_route("note_read"));
+        assert!(server.tool_router.has_route("vault_list"));
+        assert!(server.tool_router.has_route("search_text"));
+        assert!(server.tool_router.has_route("search_semantic"));
+        assert!(server.tool_router.has_route("wikilinks"));
+
+        assert!(!server.tool_router.has_route("note_create"));
+        assert!(!server.tool_router.has_route("note_write"));
+        assert!(!server.tool_router.has_route("note_delete"));
+        assert!(!server.tool_router.has_route("note_move"));
+    }
+
+    #[tokio::test]
+    async fn minimal_profile_exposes_6_tools() {
+        let (_tmp, server) = build_server(ToolFilter::Profile("minimal".into())).await;
+        let tools = server.tool_router.list_all();
+        assert_eq!(tools.len(), 6, "minimal profile should expose 6 tools");
+
+        let expected = [
+            "note_read",
+            "note_create",
+            "note_write",
+            "vault_list",
+            "search_text",
+            "vault_info",
+        ];
+        for name in &expected {
+            assert!(
+                server.tool_router.has_route(name),
+                "minimal profile should include '{name}'"
+            );
+        }
+        assert!(!server.tool_router.has_route("search_regex"));
+        assert!(!server.tool_router.has_route("wikilinks"));
+        assert!(!server.tool_router.has_route("frontmatter"));
+    }
+
+    #[tokio::test]
+    async fn allow_list_only_listed_tools() {
+        let allowed: HashSet<String> = ["note_read", "vault_list"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (_tmp, server) = build_server(ToolFilter::AllowList(allowed)).await;
+        let tools = server.tool_router.list_all();
+        assert_eq!(tools.len(), 2, "allow-list should expose only 2 tools");
+
+        assert!(server.tool_router.has_route("note_read"));
+        assert!(server.tool_router.has_route("vault_list"));
+        assert!(!server.tool_router.has_route("note_create"));
+        assert!(!server.tool_router.has_route("search_text"));
+    }
+
+    #[tokio::test]
+    async fn deny_list_hides_only_listed_tools() {
+        let denied: HashSet<String> = ["open_in_obsidian", "wikilinks"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (_tmp, server) = build_server(ToolFilter::DenyList(denied)).await;
+        let tools = server.tool_router.list_all();
+        assert_eq!(
+            tools.len(),
+            ALL_TOOL_NAMES.len() - 2,
+            "deny-list should hide 2 tools"
+        );
+
+        assert!(!server.tool_router.has_route("open_in_obsidian"));
+        assert!(!server.tool_router.has_route("wikilinks"));
+        assert!(server.tool_router.has_route("note_read"));
+        assert!(server.tool_router.has_route("vault_list"));
+        assert!(server.tool_router.has_route("search_text"));
+    }
+}
+
 // ── Semantic search (embeddings feature) ────────────────────────────────
 
 #[cfg(feature = "embeddings")]
