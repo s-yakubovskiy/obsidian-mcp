@@ -99,36 +99,7 @@ pub async fn search_regex(
     Ok(CallToolResult::success(vec![Content::text(json)]))
 }
 
-// ── search_tag ──────────────────────────────────────────────────────
-
-#[derive(Deserialize, JsonSchema, Default)]
-pub struct SearchTagParams {
-    /// Tag to search for (without the `#` prefix).
-    pub tag: String,
-    /// If true, also match nested tags (e.g. `inbox` matches `inbox/read`). Default: true.
-    #[serde(default)]
-    pub include_nested: Option<bool>,
-}
-
-pub async fn search_tag(
-    vault: &Vault,
-    params: SearchTagParams,
-) -> Result<CallToolResult, rmcp::ErrorData> {
-    let tag = params.tag.strip_prefix('#').unwrap_or(&params.tag);
-    let include_nested = params.include_nested.unwrap_or(true);
-
-    let results = if include_nested {
-        vault.search_by_tag_prefix(tag)?
-    } else {
-        vault.search_by_tag(tag)?
-    };
-
-    let json = serde_json::to_string_pretty(&results)
-        .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))?;
-    Ok(CallToolResult::success(vec![Content::text(json)]))
-}
-
-// ── search_frontmatter ─────────────────────────────────────────────
+// ── search_metadata ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "snake_case")]
@@ -143,42 +114,105 @@ pub enum FrontmatterOperator {
 }
 
 #[derive(Deserialize, JsonSchema, Default)]
-pub struct SearchFrontmatterParams {
-    /// Frontmatter field name to query.
-    pub field: String,
-    /// Value to compare against. Required for `eq` and `contains`; ignored for `exists`.
+pub struct SearchMetadataParams {
+    /// Type of metadata search: `"tag"` to find notes by tag, or `"frontmatter"` to query by frontmatter field.
+    #[serde(rename = "type")]
+    pub search_type: String,
+    /// Tag to search for (without the `#` prefix). Required when type is `"tag"`.
+    #[serde(default)]
+    pub tag: Option<String>,
+    /// If true, also match nested tags (e.g. `inbox` matches `inbox/read`). Default: true. Only used when type is `"tag"`.
+    #[serde(default)]
+    pub include_nested: Option<bool>,
+    /// Frontmatter field name to query. Required when type is `"frontmatter"`.
+    #[serde(default)]
+    pub field: Option<String>,
+    /// Value to compare against. Required for `eq` and `contains` operators; ignored for `exists`. Only used when type is `"frontmatter"`.
     #[serde(default)]
     pub value: Option<serde_json::Value>,
-    /// Comparison operator (default: `eq`).
+    /// Comparison operator (default: `eq`). Only used when type is `"frontmatter"`.
     #[serde(default)]
-    pub operator: FrontmatterOperator,
+    pub operator: Option<FrontmatterOperator>,
 }
 
-pub async fn search_frontmatter(
+pub async fn search_metadata(
     vault: &Vault,
-    params: SearchFrontmatterParams,
+    params: SearchMetadataParams,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    let results = match params.operator {
-        FrontmatterOperator::Exists => vault.search_frontmatter_exists(&params.field)?,
+    let search_type = params.search_type.as_str();
+
+    if search_type.eq_ignore_ascii_case("tag") {
+        search_metadata_tag(vault, &params)
+    } else if search_type.eq_ignore_ascii_case("frontmatter") {
+        search_metadata_frontmatter(vault, &params)
+    } else {
+        Err(rmcp::ErrorData::new(
+            ErrorCode::INVALID_PARAMS,
+            format!("Unknown type '{search_type}'. Valid values: \"tag\", \"frontmatter\""),
+            None::<serde_json::Value>,
+        ))
+    }
+}
+
+fn search_metadata_tag(
+    vault: &Vault,
+    params: &SearchMetadataParams,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    let tag = params.tag.as_deref().ok_or_else(|| {
+        rmcp::ErrorData::new(
+            ErrorCode::INVALID_PARAMS,
+            "'tag' is required when type is \"tag\"",
+            None::<serde_json::Value>,
+        )
+    })?;
+    let tag = tag.strip_prefix('#').unwrap_or(tag);
+    let include_nested = params.include_nested.unwrap_or(true);
+
+    let results = if include_nested {
+        vault.search_by_tag_prefix(tag)?
+    } else {
+        vault.search_by_tag(tag)?
+    };
+
+    let json = serde_json::to_string_pretty(&results)
+        .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))?;
+    Ok(CallToolResult::success(vec![Content::text(json)]))
+}
+
+fn search_metadata_frontmatter(
+    vault: &Vault,
+    params: &SearchMetadataParams,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    let field = params.field.as_deref().ok_or_else(|| {
+        rmcp::ErrorData::new(
+            ErrorCode::INVALID_PARAMS,
+            "'field' is required when type is \"frontmatter\"",
+            None::<serde_json::Value>,
+        )
+    })?;
+    let operator = params.operator.clone().unwrap_or_default();
+
+    let results = match operator {
+        FrontmatterOperator::Exists => vault.search_frontmatter_exists(field)?,
         FrontmatterOperator::Eq => {
-            let value = params.value.ok_or_else(|| {
+            let value = params.value.as_ref().ok_or_else(|| {
                 rmcp::ErrorData::new(
                     ErrorCode::INVALID_PARAMS,
                     "'value' is required for 'eq' operator",
                     None::<serde_json::Value>,
                 )
             })?;
-            vault.search_frontmatter(&params.field, &value)?
+            vault.search_frontmatter(field, value)?
         }
         FrontmatterOperator::Contains => {
-            let value = params.value.ok_or_else(|| {
+            let value = params.value.as_ref().ok_or_else(|| {
                 rmcp::ErrorData::new(
                     ErrorCode::INVALID_PARAMS,
                     "'value' is required for 'contains' operator",
                     None::<serde_json::Value>,
                 )
             })?;
-            vault.search_frontmatter_contains(&params.field, &value)?
+            vault.search_frontmatter_contains(field, value)?
         }
     };
 
@@ -723,16 +757,18 @@ mod tests {
         assert!(parsed.len() <= 2);
     }
 
-    // ── search_tag ──────────────────────────────────────────────────
+    // ── search_metadata (tag) ──────────────────────────────────────
 
     #[tokio::test]
-    async fn search_tag_exact() {
+    async fn search_metadata_tag_exact() {
         let (_dir, vault) = setup_search_vault().await;
-        let result = search_tag(
+        let result = search_metadata(
             &vault,
-            SearchTagParams {
-                tag: "inbox".into(),
+            SearchMetadataParams {
+                search_type: "tag".into(),
+                tag: Some("inbox".into()),
                 include_nested: Some(false),
+                ..Default::default()
             },
         )
         .await
@@ -745,13 +781,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_tag_include_nested() {
+    async fn search_metadata_tag_include_nested() {
         let (_dir, vault) = setup_search_vault().await;
-        let result = search_tag(
+        let result = search_metadata(
             &vault,
-            SearchTagParams {
-                tag: "inbox".into(),
+            SearchMetadataParams {
+                search_type: "tag".into(),
+                tag: Some("inbox".into()),
                 include_nested: Some(true),
+                ..Default::default()
             },
         )
         .await
@@ -762,13 +800,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_tag_strips_hash_prefix() {
+    async fn search_metadata_tag_strips_hash_prefix() {
         let (_dir, vault) = setup_search_vault().await;
-        let result = search_tag(
+        let result = search_metadata(
             &vault,
-            SearchTagParams {
-                tag: "#lang".into(),
+            SearchMetadataParams {
+                search_type: "tag".into(),
+                tag: Some("#lang".into()),
                 include_nested: Some(false),
+                ..Default::default()
             },
         )
         .await
@@ -779,17 +819,34 @@ mod tests {
         assert_eq!(parsed.len(), 2);
     }
 
-    // ── search_frontmatter ──────────────────────────────────────────
+    #[tokio::test]
+    async fn search_metadata_tag_missing_tag_errors() {
+        let (_dir, vault) = setup_search_vault().await;
+        let result = search_metadata(
+            &vault,
+            SearchMetadataParams {
+                search_type: "tag".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    // ── search_metadata (frontmatter) ───────────────────────────────
 
     #[tokio::test]
-    async fn search_frontmatter_eq() {
+    async fn search_metadata_frontmatter_eq() {
         let (_dir, vault) = setup_search_vault().await;
-        let result = search_frontmatter(
+        let result = search_metadata(
             &vault,
-            SearchFrontmatterParams {
-                field: "status".into(),
+            SearchMetadataParams {
+                search_type: "frontmatter".into(),
+                field: Some("status".into()),
                 value: Some(serde_json::json!("stable")),
-                operator: FrontmatterOperator::Eq,
+                operator: Some(FrontmatterOperator::Eq),
+                ..Default::default()
             },
         )
         .await
@@ -802,14 +859,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_frontmatter_eq_array_contains() {
+    async fn search_metadata_frontmatter_eq_array_contains() {
         let (_dir, vault) = setup_search_vault().await;
-        let result = search_frontmatter(
+        let result = search_metadata(
             &vault,
-            SearchFrontmatterParams {
-                field: "tags".into(),
+            SearchMetadataParams {
+                search_type: "frontmatter".into(),
+                field: Some("tags".into()),
                 value: Some(serde_json::json!("systems")),
-                operator: FrontmatterOperator::Eq,
+                operator: Some(FrontmatterOperator::Eq),
+                ..Default::default()
             },
         )
         .await
@@ -820,14 +879,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_frontmatter_contains_substring() {
+    async fn search_metadata_frontmatter_contains_substring() {
         let (_dir, vault) = setup_search_vault().await;
-        let result = search_frontmatter(
+        let result = search_metadata(
             &vault,
-            SearchFrontmatterParams {
-                field: "status".into(),
+            SearchMetadataParams {
+                search_type: "frontmatter".into(),
+                field: Some("status".into()),
                 value: Some(serde_json::json!("progress")),
-                operator: FrontmatterOperator::Contains,
+                operator: Some(FrontmatterOperator::Contains),
+                ..Default::default()
             },
         )
         .await
@@ -840,14 +901,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_frontmatter_exists() {
+    async fn search_metadata_frontmatter_exists() {
         let (_dir, vault) = setup_search_vault().await;
-        let result = search_frontmatter(
+        let result = search_metadata(
             &vault,
-            SearchFrontmatterParams {
-                field: "status".into(),
-                value: None,
-                operator: FrontmatterOperator::Exists,
+            SearchMetadataParams {
+                search_type: "frontmatter".into(),
+                field: Some("status".into()),
+                operator: Some(FrontmatterOperator::Exists),
+                ..Default::default()
             },
         )
         .await
@@ -859,14 +921,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_frontmatter_exists_missing_field() {
+    async fn search_metadata_frontmatter_exists_missing_field() {
         let (_dir, vault) = setup_search_vault().await;
-        let result = search_frontmatter(
+        let result = search_metadata(
             &vault,
-            SearchFrontmatterParams {
-                field: "nonexistent".into(),
-                value: None,
-                operator: FrontmatterOperator::Exists,
+            SearchMetadataParams {
+                search_type: "frontmatter".into(),
+                field: Some("nonexistent".into()),
+                operator: Some(FrontmatterOperator::Exists),
+                ..Default::default()
             },
         )
         .await
@@ -878,14 +941,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_frontmatter_eq_without_value_errors() {
+    async fn search_metadata_frontmatter_eq_without_value_errors() {
         let (_dir, vault) = setup_search_vault().await;
-        let result = search_frontmatter(
+        let result = search_metadata(
             &vault,
-            SearchFrontmatterParams {
-                field: "status".into(),
-                value: None,
-                operator: FrontmatterOperator::Eq,
+            SearchMetadataParams {
+                search_type: "frontmatter".into(),
+                field: Some("status".into()),
+                operator: Some(FrontmatterOperator::Eq),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn search_metadata_frontmatter_missing_field_errors() {
+        let (_dir, vault) = setup_search_vault().await;
+        let result = search_metadata(
+            &vault,
+            SearchMetadataParams {
+                search_type: "frontmatter".into(),
+                value: Some(serde_json::json!("test")),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn search_metadata_invalid_type_errors() {
+        let (_dir, vault) = setup_search_vault().await;
+        let result = search_metadata(
+            &vault,
+            SearchMetadataParams {
+                search_type: "invalid".into(),
+                ..Default::default()
             },
         )
         .await;

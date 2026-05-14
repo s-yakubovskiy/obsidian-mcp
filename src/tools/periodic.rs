@@ -1,4 +1,4 @@
-//! Daily, weekly, and periodic note tools.
+//! Periodic note tool — unified handler for daily, weekly, monthly, quarterly, yearly notes.
 
 use chrono::NaiveDate;
 use rmcp::model::ErrorCode;
@@ -18,82 +18,165 @@ fn parse_date(date_str: &str) -> Result<NaiveDate, rmcp::ErrorData> {
     })
 }
 
-// ── periodic_get ────────────────────────────────────────────────────
-
 #[derive(Deserialize, JsonSchema, Default)]
-pub struct PeriodicGetParams {
+pub struct PeriodicParams {
+    /// Action to perform: `"get"` (read note content), `"create"` (create from template or custom content), or `"list"` (list recent notes).
+    pub action: String,
     /// Period type: daily, weekly, monthly, quarterly, yearly.
     pub period: NotePeriod,
-    /// ISO date (YYYY-MM-DD). Defaults to today if omitted.
+    /// ISO date (YYYY-MM-DD). Defaults to today. Used by `"get"` and `"create"`.
     #[serde(default)]
     pub date: Option<String>,
-}
-
-/// Read the content of a periodic note for the given period and date.
-pub async fn periodic_get(
-    vault: &Vault,
-    params: PeriodicGetParams,
-) -> Result<String, rmcp::ErrorData> {
-    let date = params.date.map(|s| parse_date(&s)).transpose()?;
-    Ok(vault.get_periodic_note(&params.period, date)?)
-}
-
-// ── periodic_create ─────────────────────────────────────────────────
-
-#[derive(Deserialize, JsonSchema, Default)]
-pub struct PeriodicCreateParams {
-    /// Period type: daily, weekly, monthly, quarterly, yearly.
-    pub period: NotePeriod,
-    /// ISO date (YYYY-MM-DD). Defaults to today if omitted.
-    #[serde(default)]
-    pub date: Option<String>,
-    /// Custom content; overrides configured template expansion.
+    /// Custom content; overrides template expansion. Only used by `"create"`.
     #[serde(default)]
     pub content: Option<String>,
-}
-
-/// Create a periodic note, optionally with custom content instead of the template.
-pub async fn periodic_create(
-    vault: &Vault,
-    params: PeriodicCreateParams,
-) -> Result<String, rmcp::ErrorData> {
-    let date = params.date.map(|s| parse_date(&s)).transpose()?;
-    let path = vault.create_periodic_note(&params.period, date, params.content.as_deref())?;
-
-    Ok(format!("Created: {}", path.display()))
-}
-
-// ── periodic_list_recent ────────────────────────────────────────────
-
-#[derive(Deserialize, JsonSchema, Default)]
-pub struct PeriodicListRecentParams {
-    /// Period type: daily, weekly, monthly, quarterly, yearly.
-    pub period: NotePeriod,
-    /// Maximum number of notes to return (default: 10).
+    /// Maximum number of notes to return (default: 10). Only used by `"list"`.
     #[serde(default)]
     pub limit: Option<usize>,
 }
 
-/// List recent periodic notes sorted newest-first.
-pub async fn periodic_list_recent(
-    vault: &Vault,
-    params: PeriodicListRecentParams,
-) -> Result<String, rmcp::ErrorData> {
-    let limit = params.limit.unwrap_or(10);
-    let paths = vault.list_recent_periodic_notes(&params.period, limit)?;
+pub async fn periodic(vault: &Vault, params: PeriodicParams) -> Result<String, rmcp::ErrorData> {
+    match params.action.to_ascii_lowercase().as_str() {
+        "get" => {
+            let date = params.date.map(|s| parse_date(&s)).transpose()?;
+            Ok(vault.get_periodic_note(&params.period, date)?)
+        }
+        "create" => {
+            let date = params.date.map(|s| parse_date(&s)).transpose()?;
+            let path =
+                vault.create_periodic_note(&params.period, date, params.content.as_deref())?;
+            Ok(format!("Created: {}", path.display()))
+        }
+        "list" => {
+            let limit = params.limit.unwrap_or(10);
+            let paths = vault.list_recent_periodic_notes(&params.period, limit)?;
 
-    let items: Vec<serde_json::Value> = paths
-        .into_iter()
-        .map(|p| {
-            let date = p
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default()
-                .to_string();
-            serde_json::json!({ "path": p.to_string_lossy(), "date": date })
-        })
-        .collect();
+            let items: Vec<serde_json::Value> = paths
+                .into_iter()
+                .map(|p| {
+                    let date = p
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    serde_json::json!({ "path": p.to_string_lossy(), "date": date })
+                })
+                .collect();
 
-    serde_json::to_string_pretty(&items)
-        .map_err(|e| rmcp::ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))
+            serde_json::to_string_pretty(&items)
+                .map_err(|e| rmcp::ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))
+        }
+        other => Err(rmcp::ErrorData::new(
+            ErrorCode::INVALID_PARAMS,
+            format!("Unknown action '{other}'. Valid values: \"get\", \"create\", \"list\""),
+            None,
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+    use crate::test_helpers::{create_test_vault, test_config};
+
+    fn setup_daily_config(dir: &std::path::Path) {
+        create_test_vault(dir);
+        let daily_dir = dir.join("Daily");
+        fs::create_dir_all(&daily_dir).unwrap();
+        fs::write(
+            dir.join(".obsidian/daily-notes.json"),
+            r#"{"format":"YYYY-MM-DD","folder":"Daily"}"#,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_action_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_daily_config(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+
+        let result = periodic(
+            &vault,
+            PeriodicParams {
+                action: "destroy".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        let err = result.unwrap_err();
+        assert!(err.message.contains("Unknown action"));
+        assert!(err.message.contains("destroy"));
+    }
+
+    #[tokio::test]
+    async fn action_is_case_insensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_daily_config(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+
+        let result = periodic(
+            &vault,
+            PeriodicParams {
+                action: "LIST".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn list_returns_empty_array() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_daily_config(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+
+        let result = periodic(
+            &vault,
+            PeriodicParams {
+                action: "list".into(),
+                limit: Some(5),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let items: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_then_get() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_daily_config(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+
+        let msg = periodic(
+            &vault,
+            PeriodicParams {
+                action: "create".into(),
+                date: Some("2026-01-15".into()),
+                content: Some("hello periodic".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(msg.contains("Created"));
+
+        let content = periodic(
+            &vault,
+            PeriodicParams {
+                action: "get".into(),
+                date: Some("2026-01-15".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(content.contains("hello periodic"));
+    }
 }

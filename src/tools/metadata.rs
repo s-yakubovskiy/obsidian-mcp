@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, Content, ErrorCode};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -10,15 +10,17 @@ use crate::error::VaultError;
 use crate::models::{FileStat, Heading, WikiLink};
 use crate::vault::Vault;
 
-// ── note_metadata ──────────────────────────────────────────────────────
+// ── note_inspect ───────────────────────────────────────────────────────
 
+/// Parameters for the `note_inspect` tool.
 #[derive(Deserialize, JsonSchema, Default)]
-pub struct NoteMetadataParams {
+pub struct NoteInspectParams {
     /// Path to the note, relative to vault root.
     pub path: String,
+    /// View to return: `"metadata"` (default) for rich note metadata, or `"targets"` for patchable headings/blocks/frontmatter fields.
+    pub view: Option<String>,
 }
 
-/// Enriched note metadata including backlinks count.
 #[derive(Serialize, JsonSchema)]
 struct NoteMetadataOutput {
     path: PathBuf,
@@ -32,13 +34,31 @@ struct NoteMetadataOutput {
     stat: FileStat,
 }
 
-/// Get rich metadata about a note: tags, headings, links, backlinks count,
-/// frontmatter, and file stats.
-pub async fn note_metadata(
+/// Inspect a note's metadata or patch targets.
+pub async fn note_inspect(
     vault: &Vault,
-    params: NoteMetadataParams,
+    params: NoteInspectParams,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    let path = Path::new(&params.path);
+    let view = params.view.as_deref().unwrap_or("metadata");
+
+    if view.eq_ignore_ascii_case("metadata") {
+        note_inspect_metadata(vault, &params.path).await
+    } else if view.eq_ignore_ascii_case("targets") {
+        note_inspect_targets(vault, &params.path).await
+    } else {
+        Err(rmcp::ErrorData::new(
+            ErrorCode::INVALID_PARAMS,
+            format!("Unknown view '{view}'. Valid values: \"metadata\", \"targets\""),
+            None::<serde_json::Value>,
+        ))
+    }
+}
+
+async fn note_inspect_metadata(
+    vault: &Vault,
+    note_path: &str,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    let path = Path::new(note_path);
     let meta = vault.get_note_metadata(path)?;
     let backlinks = vault.backlinks(path)?;
 
@@ -59,21 +79,11 @@ pub async fn note_metadata(
     Ok(CallToolResult::structured(value))
 }
 
-// ── note_document_map ──────────────────────────────────────────────────
-
-#[derive(Deserialize, JsonSchema, Default)]
-pub struct NoteDocumentMapParams {
-    /// Path to the note, relative to vault root.
-    pub path: String,
-}
-
-/// List all patch targets in a note: headings (with hierarchy),
-/// block refs, and frontmatter fields.
-pub async fn note_document_map(
+async fn note_inspect_targets(
     vault: &Vault,
-    params: NoteDocumentMapParams,
+    note_path: &str,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    let path = Path::new(&params.path);
+    let path = Path::new(note_path);
     let map = vault.get_document_map(path)?;
 
     let value = serde_json::to_value(map)
@@ -81,76 +91,77 @@ pub async fn note_document_map(
     Ok(CallToolResult::structured(value))
 }
 
-// ── frontmatter_get ────────────────────────────────────────────────────
+// ── frontmatter ────────────────────────────────────────────────────────
 
+/// Parameters for the `frontmatter` tool.
 #[derive(Deserialize, JsonSchema, Default)]
-pub struct FrontmatterGetParams {
+pub struct FrontmatterParams {
+    /// Action to perform: `"get"` (return all frontmatter), `"set"` (upsert a field), or `"remove"` (delete a field).
+    pub action: String,
     /// Path to the note, relative to vault root.
     pub path: String,
+    /// Frontmatter key. Required for `"set"` and `"remove"` actions.
+    pub key: Option<String>,
+    /// JSON value to assign. Required for `"set"` action.
+    pub value: Option<serde_json::Value>,
 }
 
-/// Get a note's frontmatter as a JSON object, or null if absent.
-pub async fn frontmatter_get(
+/// Read, set, or remove frontmatter fields on a note.
+pub async fn frontmatter(
     vault: &Vault,
-    params: FrontmatterGetParams,
+    params: FrontmatterParams,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     let path = Path::new(&params.path);
-    let fm = vault.get_frontmatter(path)?;
 
-    match fm {
-        Some(value) => Ok(CallToolResult::structured(value)),
-        None => Ok(CallToolResult::success(vec![Content::text("null")])),
+    if params.action.eq_ignore_ascii_case("get") {
+        let fm = vault.get_frontmatter(path)?;
+        match fm {
+            Some(value) => Ok(CallToolResult::structured(value)),
+            None => Ok(CallToolResult::success(vec![Content::text("null")])),
+        }
+    } else if params.action.eq_ignore_ascii_case("set") {
+        let key = params.key.as_deref().ok_or_else(|| {
+            rmcp::ErrorData::new(
+                ErrorCode::INVALID_PARAMS,
+                "'key' is required for action 'set'",
+                None::<serde_json::Value>,
+            )
+        })?;
+        let value = params.value.ok_or_else(|| {
+            rmcp::ErrorData::new(
+                ErrorCode::INVALID_PARAMS,
+                "'value' is required for action 'set'",
+                None::<serde_json::Value>,
+            )
+        })?;
+        vault.set_frontmatter_field(path, key, value)?;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Set frontmatter field '{key}' on '{}'",
+            params.path
+        ))]))
+    } else if params.action.eq_ignore_ascii_case("remove") {
+        let key = params.key.as_deref().ok_or_else(|| {
+            rmcp::ErrorData::new(
+                ErrorCode::INVALID_PARAMS,
+                "'key' is required for action 'remove'",
+                None::<serde_json::Value>,
+            )
+        })?;
+        vault.remove_frontmatter_field(path, key)?;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Removed frontmatter field '{key}' from '{}'",
+            params.path
+        ))]))
+    } else {
+        Err(rmcp::ErrorData::new(
+            ErrorCode::INVALID_PARAMS,
+            format!(
+                "Unknown action '{}'. Valid values: \"get\", \"set\", \"remove\"",
+                params.action
+            ),
+            None::<serde_json::Value>,
+        ))
     }
-}
-
-// ── frontmatter_set ────────────────────────────────────────────────────
-
-#[derive(Deserialize, JsonSchema, Default)]
-pub struct FrontmatterSetParams {
-    /// Path to the note, relative to vault root.
-    pub path: String,
-    /// Frontmatter key to set.
-    pub key: String,
-    /// JSON value to assign to the key.
-    pub value: serde_json::Value,
-}
-
-/// Set a single frontmatter field on a note (upsert).
-pub async fn frontmatter_set(
-    vault: &Vault,
-    params: FrontmatterSetParams,
-) -> Result<CallToolResult, rmcp::ErrorData> {
-    let path = Path::new(&params.path);
-    vault.set_frontmatter_field(path, &params.key, params.value)?;
-
-    Ok(CallToolResult::success(vec![Content::text(format!(
-        "Set frontmatter field '{}' on '{}'",
-        params.key, params.path
-    ))]))
-}
-
-// ── frontmatter_remove ─────────────────────────────────────────────────
-
-#[derive(Deserialize, JsonSchema, Default)]
-pub struct FrontmatterRemoveParams {
-    /// Path to the note, relative to vault root.
-    pub path: String,
-    /// Frontmatter key to remove.
-    pub key: String,
-}
-
-/// Remove a single frontmatter field from a note.
-pub async fn frontmatter_remove(
-    vault: &Vault,
-    params: FrontmatterRemoveParams,
-) -> Result<CallToolResult, rmcp::ErrorData> {
-    let path = Path::new(&params.path);
-    vault.remove_frontmatter_field(path, &params.key)?;
-
-    Ok(CallToolResult::success(vec![Content::text(format!(
-        "Removed frontmatter field '{}' from '{}'",
-        params.key, params.path
-    ))]))
 }
 
 #[cfg(test)]
@@ -159,7 +170,7 @@ mod tests {
     use crate::test_helpers::{create_test_vault, test_config};
 
     #[tokio::test]
-    async fn note_metadata_returns_all_fields() {
+    async fn note_inspect_metadata_returns_all_fields() {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
@@ -174,10 +185,11 @@ mod tests {
             .write_note(Path::new("other.md"), "# Other\n[[test]]\n")
             .unwrap();
 
-        let result = note_metadata(
+        let result = note_inspect(
             &vault,
-            NoteMetadataParams {
+            NoteInspectParams {
                 path: "test.md".into(),
+                view: None,
             },
         )
         .await
@@ -205,15 +217,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn note_metadata_not_found() {
+    async fn note_inspect_not_found() {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        let result = note_metadata(
+        let result = note_inspect(
             &vault,
-            NoteMetadataParams {
+            NoteInspectParams {
                 path: "nonexistent.md".into(),
+                view: None,
             },
         )
         .await;
@@ -221,7 +234,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn document_map_lists_targets() {
+    async fn note_inspect_targets_lists_targets() {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
@@ -233,10 +246,11 @@ mod tests {
             )
             .unwrap();
 
-        let result = note_document_map(
+        let result = note_inspect(
             &vault,
-            NoteDocumentMapParams {
+            NoteInspectParams {
                 path: "mapped.md".into(),
+                view: Some("targets".into()),
             },
         )
         .await
@@ -271,6 +285,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn note_inspect_invalid_view() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+
+        vault.write_note(Path::new("test.md"), "# Note\n").unwrap();
+
+        let result = note_inspect(
+            &vault,
+            NoteInspectParams {
+                path: "test.md".into(),
+                view: Some("invalid".into()),
+            },
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
     async fn frontmatter_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
@@ -280,10 +313,12 @@ mod tests {
             .write_note(Path::new("fm.md"), "# Note\nBody\n")
             .unwrap();
 
-        let result = frontmatter_get(
+        let result = frontmatter(
             &vault,
-            FrontmatterGetParams {
+            FrontmatterParams {
+                action: "get".into(),
                 path: "fm.md".into(),
+                ..Default::default()
             },
         )
         .await
@@ -292,21 +327,24 @@ mod tests {
         let text = result.content[0].as_text().expect("expected text content");
         assert_eq!(text.text, "null");
 
-        frontmatter_set(
+        frontmatter(
             &vault,
-            FrontmatterSetParams {
+            FrontmatterParams {
+                action: "set".into(),
                 path: "fm.md".into(),
-                key: "status".into(),
-                value: serde_json::json!("draft"),
+                key: Some("status".into()),
+                value: Some(serde_json::json!("draft")),
             },
         )
         .await
         .unwrap();
 
-        let result = frontmatter_get(
+        let result = frontmatter(
             &vault,
-            FrontmatterGetParams {
+            FrontmatterParams {
+                action: "get".into(),
                 path: "fm.md".into(),
+                ..Default::default()
             },
         )
         .await
@@ -314,21 +352,24 @@ mod tests {
         let fm = result.structured_content.unwrap();
         assert_eq!(fm["status"], "draft");
 
-        frontmatter_set(
+        frontmatter(
             &vault,
-            FrontmatterSetParams {
+            FrontmatterParams {
+                action: "set".into(),
                 path: "fm.md".into(),
-                key: "tags".into(),
-                value: serde_json::json!(["rust", "mcp"]),
+                key: Some("tags".into()),
+                value: Some(serde_json::json!(["rust", "mcp"])),
             },
         )
         .await
         .unwrap();
 
-        let result = frontmatter_get(
+        let result = frontmatter(
             &vault,
-            FrontmatterGetParams {
+            FrontmatterParams {
+                action: "GET".into(),
                 path: "fm.md".into(),
+                ..Default::default()
             },
         )
         .await
@@ -337,20 +378,24 @@ mod tests {
         assert_eq!(fm["status"], "draft");
         assert_eq!(fm["tags"], serde_json::json!(["rust", "mcp"]));
 
-        frontmatter_remove(
+        frontmatter(
             &vault,
-            FrontmatterRemoveParams {
+            FrontmatterParams {
+                action: "remove".into(),
                 path: "fm.md".into(),
-                key: "status".into(),
+                key: Some("status".into()),
+                value: None,
             },
         )
         .await
         .unwrap();
 
-        let result = frontmatter_get(
+        let result = frontmatter(
             &vault,
-            FrontmatterGetParams {
+            FrontmatterParams {
+                action: "get".into(),
                 path: "fm.md".into(),
+                ..Default::default()
             },
         )
         .await
@@ -358,5 +403,84 @@ mod tests {
         let fm = result.structured_content.unwrap();
         assert!(fm.get("status").is_none());
         assert_eq!(fm["tags"], serde_json::json!(["rust", "mcp"]));
+    }
+
+    #[tokio::test]
+    async fn frontmatter_invalid_action() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+        vault.write_note(Path::new("fm.md"), "# Note\n").unwrap();
+
+        let result = frontmatter(
+            &vault,
+            FrontmatterParams {
+                action: "invalid".into(),
+                path: "fm.md".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn frontmatter_set_missing_key() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+        vault.write_note(Path::new("fm.md"), "# Note\n").unwrap();
+
+        let result = frontmatter(
+            &vault,
+            FrontmatterParams {
+                action: "set".into(),
+                path: "fm.md".into(),
+                key: None,
+                value: Some(serde_json::json!("val")),
+            },
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn frontmatter_set_missing_value() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+        vault.write_note(Path::new("fm.md"), "# Note\n").unwrap();
+
+        let result = frontmatter(
+            &vault,
+            FrontmatterParams {
+                action: "set".into(),
+                path: "fm.md".into(),
+                key: Some("k".into()),
+                value: None,
+            },
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn frontmatter_remove_missing_key() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+        vault.write_note(Path::new("fm.md"), "# Note\n").unwrap();
+
+        let result = frontmatter(
+            &vault,
+            FrontmatterParams {
+                action: "remove".into(),
+                path: "fm.md".into(),
+                key: None,
+                value: None,
+            },
+        )
+        .await;
+        assert!(result.is_err());
     }
 }

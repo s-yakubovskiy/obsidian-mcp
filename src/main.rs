@@ -466,6 +466,7 @@ mod tests {
             embeddings: false,
             embeddings_model: "BAAI/bge-small-en-v1.5".to_string(),
             hybrid_alpha: 0.25,
+            tool_filter: obsidian_mcp::config::ToolFilter::Full,
         };
         let runtime = init_semantic_runtime(&config, &runtime_config(SemanticMode::Daemon)).await;
         assert!(runtime.daemon_client.is_none());

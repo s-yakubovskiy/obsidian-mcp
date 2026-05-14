@@ -787,6 +787,7 @@ mod tests {
             embeddings: false,
             embeddings_model: String::new(),
             hybrid_alpha: 0.25,
+            tool_filter: crate::config::ToolFilter::Full,
         };
 
         let result = Vault::open(&config).await;

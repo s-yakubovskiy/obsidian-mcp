@@ -39,19 +39,14 @@ pub struct NoteWriteParams {
 }
 
 #[derive(Deserialize, JsonSchema, Default)]
-pub struct NoteAppendParams {
+pub struct NoteInsertParams {
     /// Path to the note, relative to vault root.
     pub path: String,
-    /// Content to append at the end of the note.
+    /// Content to insert.
     pub content: String,
-}
-
-#[derive(Deserialize, JsonSchema, Default)]
-pub struct NotePrependParams {
-    /// Path to the note, relative to vault root.
-    pub path: String,
-    /// Content to insert after frontmatter (or at the very start if no frontmatter).
-    pub content: String,
+    /// Where to insert: `"end"` (default) appends after existing content; `"beginning"` inserts after frontmatter (or at the very start if no frontmatter).
+    #[serde(default)]
+    pub position: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -116,14 +111,22 @@ pub async fn note_write(vault: &Vault, params: NoteWriteParams) -> Result<String
     Ok(format!("Written to: {}", params.path))
 }
 
-pub async fn note_append(vault: &Vault, params: NoteAppendParams) -> Result<String, ErrorData> {
-    vault.append_note(Path::new(&params.path), &params.content)?;
-    Ok(format!("Appended to: {}", params.path))
-}
+pub async fn note_insert(vault: &Vault, params: NoteInsertParams) -> Result<String, ErrorData> {
+    let position = params.position.as_deref().unwrap_or("end");
 
-pub async fn note_prepend(vault: &Vault, params: NotePrependParams) -> Result<String, ErrorData> {
-    vault.prepend_note(Path::new(&params.path), &params.content)?;
-    Ok(format!("Prepended to: {}", params.path))
+    if position.eq_ignore_ascii_case("end") {
+        vault.append_note(Path::new(&params.path), &params.content)?;
+        Ok(format!("Inserted into: {}", params.path))
+    } else if position.eq_ignore_ascii_case("beginning") {
+        vault.prepend_note(Path::new(&params.path), &params.content)?;
+        Ok(format!("Inserted into: {}", params.path))
+    } else {
+        Err(ErrorData::new(
+            ErrorCode::INVALID_PARAMS,
+            format!("Unknown position '{position}'. Valid values: \"end\", \"beginning\""),
+            None::<serde_json::Value>,
+        ))
+    }
 }
 
 pub async fn note_patch(vault: &Vault, params: NotePatchParams) -> Result<String, ErrorData> {
@@ -277,20 +280,21 @@ mod tests {
         assert_eq!(content, "new content");
     }
 
-    // ── note_append ─────────────────────────────────────────────────
+    // ── note_insert ────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn append_adds_to_end() {
+    async fn insert_end_appends_to_note() {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
         vault.write_note(Path::new("note.md"), "start").unwrap();
 
-        note_append(
+        note_insert(
             &vault,
-            NoteAppendParams {
+            NoteInsertParams {
                 path: "note.md".into(),
                 content: "\nmore".into(),
+                position: Some("end".into()),
             },
         )
         .await
@@ -301,10 +305,31 @@ mod tests {
         assert!(content.starts_with("start"));
     }
 
-    // ── note_prepend ────────────────────────────────────────────────
+    #[tokio::test]
+    async fn insert_default_position_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+        vault.write_note(Path::new("note.md"), "start").unwrap();
+
+        note_insert(
+            &vault,
+            NoteInsertParams {
+                path: "note.md".into(),
+                content: "\nmore".into(),
+                position: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let content = vault.read_note(Path::new("note.md")).unwrap();
+        assert!(content.ends_with("more"));
+        assert!(content.starts_with("start"));
+    }
 
     #[tokio::test]
-    async fn prepend_inserts_after_frontmatter() {
+    async fn insert_beginning_after_frontmatter() {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
@@ -312,11 +337,12 @@ mod tests {
             .write_note(Path::new("note.md"), "---\ntags: [a]\n---\n# Heading\n")
             .unwrap();
 
-        note_prepend(
+        note_insert(
             &vault,
-            NotePrependParams {
+            NoteInsertParams {
                 path: "note.md".into(),
                 content: "injected\n".into(),
+                position: Some("beginning".into()),
             },
         )
         .await
@@ -326,6 +352,49 @@ mod tests {
         assert!(content.starts_with("---\ntags:"));
         assert!(content.contains("injected"));
         assert!(content.contains("# Heading"));
+    }
+
+    #[tokio::test]
+    async fn insert_invalid_position_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+        vault.write_note(Path::new("note.md"), "content").unwrap();
+
+        let result = note_insert(
+            &vault,
+            NoteInsertParams {
+                path: "note.md".into(),
+                content: "text".into(),
+                position: Some("middle".into()),
+            },
+        )
+        .await;
+        let err = result.unwrap_err();
+        assert!(err.message.contains("Unknown position"));
+        assert!(err.message.contains("middle"));
+    }
+
+    #[tokio::test]
+    async fn insert_position_is_case_insensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+        vault.write_note(Path::new("note.md"), "start").unwrap();
+
+        note_insert(
+            &vault,
+            NoteInsertParams {
+                path: "note.md".into(),
+                content: "\nmore".into(),
+                position: Some("END".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let content = vault.read_note(Path::new("note.md")).unwrap();
+        assert!(content.ends_with("more"));
     }
 
     // ── note_patch ──────────────────────────────────────────────────

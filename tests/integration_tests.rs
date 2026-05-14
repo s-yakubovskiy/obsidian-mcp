@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use obsidian_mcp::config::Config;
+use obsidian_mcp::config::{Config, ToolFilter};
 use obsidian_mcp::models::{NotePeriod, PatchOperation, PatchRequest, PatchTargetType};
 use obsidian_mcp::vault::Vault;
 
@@ -27,6 +27,7 @@ fn fixture_config() -> Config {
         embeddings: false,
         embeddings_model: String::new(),
         hybrid_alpha: 0.25,
+        tool_filter: ToolFilter::Full,
     }
 }
 
@@ -51,6 +52,7 @@ async fn copy_fixture_to_temp() -> (tempfile::TempDir, Vault) {
         embeddings: false,
         embeddings_model: String::new(),
         hybrid_alpha: 0.25,
+        tool_filter: ToolFilter::Full,
     };
     let vault = Vault::open(&config)
         .await
@@ -330,6 +332,7 @@ mod vault_tantivy_search {
             embeddings: false,
             embeddings_model: String::new(),
             hybrid_alpha: 0.25,
+            tool_filter: ToolFilter::Full,
         };
         let vault = Vault::open(&config)
             .await
@@ -655,6 +658,7 @@ mod vault_semantic_search {
             embeddings: true,
             embeddings_model: "BAAI/bge-small-en-v1.5".into(),
             hybrid_alpha: 0.25,
+            tool_filter: ToolFilter::Full,
         }
     }
 
@@ -877,6 +881,7 @@ mod semantic_tool_runtime_modes {
             embeddings,
             embeddings_model: MODEL_NAME.to_string(),
             hybrid_alpha: 0.25,
+            tool_filter: ToolFilter::Full,
         }
     }
 

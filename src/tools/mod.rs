@@ -52,24 +52,13 @@ impl ObsidianMcp {
 
     #[tool(
         name = "vault_list",
-        description = "List files and directories in the vault. Supports recursive listing and glob filtering. Returns a JSON array of relative paths."
+        description = "List files and directories in the vault. Supports recursive listing, glob filtering, and tree view (format: \"tree\"). Returns a JSON array of paths (list mode) or a tree-formatted string (tree mode)."
     )]
     async fn vault_list(
         &self,
         Parameters(params): Parameters<navigation::VaultListParams>,
     ) -> Result<CallToolResult, ErrorData> {
         navigation::vault_list(&self.vault, params)
-    }
-
-    #[tool(
-        name = "vault_structure",
-        description = "Get a tree view of the vault directory structure, formatted like the `tree` command. Useful for understanding vault organization."
-    )]
-    async fn vault_structure(
-        &self,
-        Parameters(params): Parameters<navigation::VaultStructureParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        navigation::vault_structure(&self.vault, params)
     }
 
     // ── Note CRUD ───────────────────────────────────────────────────
@@ -108,25 +97,16 @@ impl ObsidianMcp {
     }
 
     #[tool(
-        name = "note_append",
-        description = "Append content to the end of an existing note."
+        name = "note_insert",
+        description = "Insert content into an existing note. \
+            Position: \"end\" (default) appends after existing content; \
+            \"beginning\" inserts after frontmatter (or at the very start if none)."
     )]
-    async fn note_append(
+    async fn note_insert(
         &self,
-        Parameters(params): Parameters<notes::NoteAppendParams>,
+        Parameters(params): Parameters<notes::NoteInsertParams>,
     ) -> Result<String, ErrorData> {
-        notes::note_append(&self.vault, params).await
-    }
-
-    #[tool(
-        name = "note_prepend",
-        description = "Insert content after the frontmatter block (or at the very start if no frontmatter exists)."
-    )]
-    async fn note_prepend(
-        &self,
-        Parameters(params): Parameters<notes::NotePrependParams>,
-    ) -> Result<String, ErrorData> {
-        notes::note_prepend(&self.vault, params).await
+        notes::note_insert(&self.vault, params).await
     }
 
     #[tool(
@@ -187,25 +167,14 @@ impl ObsidianMcp {
     }
 
     #[tool(
-        name = "search_tag",
-        description = "Find all notes with a specific tag (both inline #tags and frontmatter tags). Optionally include nested tags."
+        name = "search_metadata",
+        description = "Search notes by metadata. Set type=\"tag\" to find notes with a specific tag (both inline #tags and frontmatter tags), or type=\"frontmatter\" to query by frontmatter field value. For tags: provide `tag` (required) and optional `include_nested`. For frontmatter: provide `field` (required), optional `operator` (eq/contains/exists), and `value` (required for eq/contains)."
     )]
-    async fn search_tag(
+    async fn search_metadata(
         &self,
-        Parameters(params): Parameters<search::SearchTagParams>,
+        Parameters(params): Parameters<search::SearchMetadataParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        search::search_tag(&self.vault, params).await
-    }
-
-    #[tool(
-        name = "search_frontmatter",
-        description = "Query notes by frontmatter field. Supports exact match (eq), substring/element match (contains), and existence check (exists)."
-    )]
-    async fn search_frontmatter(
-        &self,
-        Parameters(params): Parameters<search::SearchFrontmatterParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        search::search_frontmatter(&self.vault, params).await
+        search::search_metadata(&self.vault, params).await
     }
 
     #[tool(
@@ -228,139 +197,54 @@ impl ObsidianMcp {
     // ── Metadata ────────────────────────────────────────────────────
 
     #[tool(
-        name = "note_metadata",
-        description = "Get rich metadata about a note: tags, headings, outgoing links, block references, backlinks count, frontmatter, and file stats."
+        name = "note_inspect",
+        description = "Inspect a note. Views: \"metadata\" (default) returns tags, headings, outgoing links, block refs, backlinks count, frontmatter, and file stats. \"targets\" lists patchable headings, block refs, and frontmatter fields (use before note_patch)."
     )]
-    async fn note_metadata(
+    async fn note_inspect(
         &self,
-        Parameters(params): Parameters<metadata::NoteMetadataParams>,
+        Parameters(params): Parameters<metadata::NoteInspectParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        metadata::note_metadata(&self.vault, params).await
+        metadata::note_inspect(&self.vault, params).await
     }
 
     #[tool(
-        name = "note_document_map",
-        description = "List all patch targets in a note: headings (with hierarchy), block references, and frontmatter field names. Use before note_patch to discover valid targets."
+        name = "frontmatter",
+        description = "Read, set, or remove frontmatter fields on a note. Actions: \"get\" returns all frontmatter as JSON (or null), \"set\" upserts a field (requires key + value), \"remove\" deletes a field (requires key)."
     )]
-    async fn note_document_map(
+    async fn frontmatter(
         &self,
-        Parameters(params): Parameters<metadata::NoteDocumentMapParams>,
+        Parameters(params): Parameters<metadata::FrontmatterParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        metadata::note_document_map(&self.vault, params).await
-    }
-
-    #[tool(
-        name = "frontmatter_get",
-        description = "Get a note's YAML frontmatter as a JSON object, or null if the note has no frontmatter."
-    )]
-    async fn frontmatter_get(
-        &self,
-        Parameters(params): Parameters<metadata::FrontmatterGetParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        metadata::frontmatter_get(&self.vault, params).await
-    }
-
-    #[tool(
-        name = "frontmatter_set",
-        description = "Set a single frontmatter field on a note (upsert). Creates the frontmatter block if it doesn't exist."
-    )]
-    async fn frontmatter_set(
-        &self,
-        Parameters(params): Parameters<metadata::FrontmatterSetParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        metadata::frontmatter_set(&self.vault, params).await
-    }
-
-    #[tool(
-        name = "frontmatter_remove",
-        description = "Remove a single frontmatter field from a note. No-op if the field doesn't exist."
-    )]
-    async fn frontmatter_remove(
-        &self,
-        Parameters(params): Parameters<metadata::FrontmatterRemoveParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        metadata::frontmatter_remove(&self.vault, params).await
+        metadata::frontmatter(&self.vault, params).await
     }
 
     // ── Graph / Links ───────────────────────────────────────────────
 
     #[tool(
-        name = "links_backlinks",
-        description = "Find all notes linking TO a given note, with the specific wikilinks used. Useful for discovering how a note is referenced."
+        name = "wikilinks",
+        description = "Query the vault's wikilink graph. Queries: \"backlinks\" (requires path) finds notes linking TO a note, \"outgoing\" (requires path) finds links FROM a note with resolution status, \"broken\" (optional path) finds unresolved wikilinks, \"orphans\" finds disconnected notes."
     )]
-    async fn links_backlinks(
+    async fn wikilinks(
         &self,
-        Parameters(params): Parameters<graph::LinksBacklinksParams>,
+        Parameters(params): Parameters<graph::WikilinksParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        graph::links_backlinks(&self.vault, params).await
-    }
-
-    #[tool(
-        name = "links_outgoing",
-        description = "Find all outgoing wikilinks FROM a given note, with resolution status showing whether each target exists."
-    )]
-    async fn links_outgoing(
-        &self,
-        Parameters(params): Parameters<graph::LinksOutgoingParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        graph::links_outgoing(&self.vault, params).await
-    }
-
-    #[tool(
-        name = "links_broken",
-        description = "Find all broken (unresolved) wikilinks in the vault, or optionally within a single note."
-    )]
-    async fn links_broken(
-        &self,
-        Parameters(params): Parameters<graph::LinksBrokenParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        graph::links_broken(&self.vault, params).await
-    }
-
-    #[tool(
-        name = "links_orphans",
-        description = "Find notes disconnected from the resolvable vault graph. Includes true orphans (no links) and notes with only broken outgoing links."
-    )]
-    async fn links_orphans(
-        &self,
-        Parameters(params): Parameters<graph::LinksOrphansParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        graph::links_orphans(&self.vault, params).await
+        graph::wikilinks(&self.vault, params).await
     }
 
     // ── Periodic Notes ──────────────────────────────────────────────
 
     #[tool(
-        name = "periodic_get",
-        description = "Read the content of a periodic note (daily, weekly, monthly, quarterly, yearly) for a given date. Defaults to today."
+        name = "periodic",
+        description = "Manage periodic notes (daily, weekly, monthly, quarterly, yearly). \
+            Actions: \"get\" — read note content (params: period, date?); \
+            \"create\" — create from template or custom content (params: period, date?, content?); \
+            \"list\" — list recent notes newest-first (params: period, limit?)."
     )]
-    async fn periodic_get(
+    async fn periodic(
         &self,
-        Parameters(params): Parameters<periodic::PeriodicGetParams>,
+        Parameters(params): Parameters<periodic::PeriodicParams>,
     ) -> Result<String, ErrorData> {
-        periodic::periodic_get(&self.vault, params).await
-    }
-
-    #[tool(
-        name = "periodic_create",
-        description = "Create a periodic note for a given date. Uses the configured template unless custom content is provided. Defaults to today."
-    )]
-    async fn periodic_create(
-        &self,
-        Parameters(params): Parameters<periodic::PeriodicCreateParams>,
-    ) -> Result<String, ErrorData> {
-        periodic::periodic_create(&self.vault, params).await
-    }
-
-    #[tool(
-        name = "periodic_list_recent",
-        description = "List recent periodic notes sorted newest-first. Returns paths and dates for the specified period type."
-    )]
-    async fn periodic_list_recent(
-        &self,
-        Parameters(params): Parameters<periodic::PeriodicListRecentParams>,
-    ) -> Result<String, ErrorData> {
-        periodic::periodic_list_recent(&self.vault, params).await
+        periodic::periodic(&self.vault, params).await
     }
 
     // ── Utility ─────────────────────────────────────────────────────

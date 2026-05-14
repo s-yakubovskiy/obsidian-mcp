@@ -4,7 +4,7 @@ use std::path::Path;
 
 use rmcp::model::CallToolResult;
 
-use crate::config::Config;
+use crate::config::{Config, ToolFilter};
 
 pub fn test_config(vault_root: &Path) -> Config {
     Config {
@@ -18,6 +18,7 @@ pub fn test_config(vault_root: &Path) -> Config {
         embeddings: false,
         embeddings_model: String::new(),
         hybrid_alpha: 0.25,
+        tool_filter: ToolFilter::Full,
     }
 }
 
@@ -33,6 +34,7 @@ pub fn tantivy_config(vault_root: &Path) -> Config {
         embeddings: false,
         embeddings_model: String::new(),
         hybrid_alpha: 0.25,
+        tool_filter: ToolFilter::Full,
     }
 }
 

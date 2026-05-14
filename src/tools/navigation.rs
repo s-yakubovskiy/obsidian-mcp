@@ -1,9 +1,9 @@
-//! Vault listing and navigation tools (`vault_list`, `vault_structure`).
+//! Vault listing and navigation tools (`vault_list`).
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, Content, ErrorCode};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -15,41 +15,65 @@ use crate::vault::Vault;
 pub struct VaultListParams {
     /// Directory path relative to vault root. Omit or leave empty for vault root.
     pub path: Option<String>,
-    /// List files recursively through subdirectories. Defaults to false.
+    /// List files recursively through subdirectories. Defaults to false. Only used in list mode.
     pub recursive: Option<bool>,
-    /// Glob pattern to filter results (e.g., `"*.md"`, `"journal/**"`).
+    /// Glob pattern to filter results (e.g., `"*.md"`, `"journal/**"`). Only used in list mode.
     pub glob: Option<String>,
+    /// Output format: `"list"` (default) returns a JSON array; `"tree"` returns a tree-formatted string.
+    pub format: Option<String>,
+    /// Maximum depth to display. In list mode, limits path component count. In tree mode, limits nesting depth.
+    pub max_depth: Option<usize>,
 }
 
-/// List files and directories in the vault. Returns a JSON array of relative paths.
+/// List files and directories in the vault.
+///
+/// In `"list"` mode (default): returns a JSON array of relative paths.
+/// In `"tree"` mode: returns a tree-formatted string like the `tree` command.
 pub fn vault_list(
     vault: &Vault,
     params: VaultListParams,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    let format = params.format.as_deref().unwrap_or("list");
+
+    if format.eq_ignore_ascii_case("list") {
+        vault_list_flat(vault, &params)
+    } else if format.eq_ignore_ascii_case("tree") {
+        vault_list_tree(vault, &params)
+    } else {
+        Err(rmcp::ErrorData::new(
+            ErrorCode::INVALID_PARAMS,
+            format!("Unknown format '{format}'. Valid values: \"list\", \"tree\""),
+            None::<serde_json::Value>,
+        ))
+    }
+}
+
+fn vault_list_flat(
+    vault: &Vault,
+    params: &VaultListParams,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     let dir = params.path.as_deref().unwrap_or("");
     let recursive = params.recursive.unwrap_or(false);
     let files = vault.list_files(Path::new(dir), recursive, params.glob.as_deref())?;
 
-    let paths: Vec<&str> = files.iter().filter_map(|p| p.to_str()).collect();
+    let paths: Vec<&str> = files
+        .iter()
+        .filter(|p| {
+            params
+                .max_depth
+                .is_none_or(|max| p.components().count() <= max)
+        })
+        .filter_map(|p| p.to_str())
+        .collect();
     let json = serde_json::to_string_pretty(&paths)
         .map_err(|e| VaultError::Other(format!("JSON serialization failed: {e}")))?;
 
     Ok(CallToolResult::success(vec![Content::text(json)]))
 }
 
-/// Parameters for the `vault_structure` tool.
-#[derive(Deserialize, JsonSchema, Default)]
-pub struct VaultStructureParams {
-    /// Directory path relative to vault root. Omit or leave empty for vault root.
-    pub path: Option<String>,
-    /// Maximum depth to display. Omit for unlimited depth.
-    pub max_depth: Option<usize>,
-}
-
-/// Get a tree view of the vault structure, formatted like the `tree` command.
-pub fn vault_structure(
+fn vault_list_tree(
     vault: &Vault,
-    params: VaultStructureParams,
+    params: &VaultListParams,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     let dir = params.path.as_deref().unwrap_or("");
     let dir_path = Path::new(dir);
@@ -240,15 +264,22 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── vault_structure ──
+    // ── vault_list (tree mode) ──
 
     #[tokio::test]
-    async fn structure_full_tree() {
+    async fn list_tree_format() {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        let result = vault_structure(&vault, VaultStructureParams::default()).unwrap();
+        let result = vault_list(
+            &vault,
+            VaultListParams {
+                format: Some("tree".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let text = extract_text(&result);
 
         assert!(text.starts_with('.'));
@@ -259,14 +290,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn structure_max_depth_1() {
+    async fn list_tree_max_depth_1() {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        let result = vault_structure(
+        let result = vault_list(
             &vault,
-            VaultStructureParams {
+            VaultListParams {
+                format: Some("tree".into()),
                 max_depth: Some(1),
                 ..Default::default()
             },
@@ -281,14 +313,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn structure_subdirectory() {
+    async fn list_tree_subdirectory() {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        let result = vault_structure(
+        let result = vault_list(
             &vault,
-            VaultStructureParams {
+            VaultListParams {
+                format: Some("tree".into()),
                 path: Some("projects".to_string()),
                 ..Default::default()
             },
@@ -303,15 +336,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn structure_nonexistent_dir_errors() {
+    async fn list_tree_nonexistent_dir_errors() {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        let result = vault_structure(
+        let result = vault_list(
             &vault,
-            VaultStructureParams {
+            VaultListParams {
+                format: Some("tree".into()),
                 path: Some("nonexistent".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn list_invalid_format_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+
+        let result = vault_list(
+            &vault,
+            VaultListParams {
+                format: Some("invalid".into()),
                 ..Default::default()
             },
         );

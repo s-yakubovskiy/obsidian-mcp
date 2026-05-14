@@ -224,6 +224,7 @@ npx @modelcontextprotocol/inspector cargo run
 | `OBSIDIAN_EMBEDDINGS` | No | `false` | Enable semantic embedding search (requires `embeddings` feature) |
 | `OBSIDIAN_EMBEDDINGS_MODEL` | No | `BAAI/bge-small-en-v1.5` | HuggingFace model name for embeddings |
 | `OBSIDIAN_HYBRID_ALPHA` | No | `0.25` | Hybrid search blending weight: `alpha * BM25 + (1-alpha) * semantic`. Clamped to [0.0, 1.0]. |
+| `OBSIDIAN_TOOLS` | No | *(unset = full)* | Tool filtering: profile name (`full`/`core`/`read`/`minimal`), comma-separated allow-list, or `!`-prefixed deny-list |
 
 ## Known Gotchas & Decisions
 
@@ -343,6 +344,9 @@ The full development plan with task breakdown, dependencies, and parallelization
 - **`/health` endpoint:** HTTP mode exposes `GET /health` returning `{"status":"ok","server":"obsidian-mcp","version":"..."}`. MCP tools are served under `/mcp`.
 - **Graceful HTTP shutdown:** The HTTP server handles both SIGTERM (Unix) and Ctrl+C for clean shutdown. On non-Unix platforms, only Ctrl+C is supported.
 - **rmcp 1.6 upgrade:** Bumped from 1.2 to 1.6. No breaking changes to our code. Key additions: Origin/Host validation for HTTP, runtime tool disabling, session store for resumability, init_timeout for streamable-http sessions.
+- **Tool consolidation (29→18):** 7 groups of related tools merged into parameterized tools using action/query/type/view string parameters. Consolidation map: `vault_structure`→`vault_list(format:"tree")`, `frontmatter_*`→`frontmatter(action)`, `note_metadata`+`note_document_map`→`note_inspect(view)`, `links_*`→`wikilinks(query)`, `periodic_*`→`periodic(action)`, `note_append`+`note_prepend`→`note_insert(position)`, `search_tag`+`search_frontmatter`→`search_metadata(type)`. Action/type params are `Option<String>` (not enums) for LLM-friendly schema. Validation returns `INVALID_PARAMS` for unknown values or missing required fields.
+- **Tool filtering (`OBSIDIAN_TOOLS`):** `ToolFilter` enum in `config.rs` with `Full`/`Profile(String)`/`AllowList(HashSet)`/`DenyList(HashSet)` variants. Detection: contains `!`→deny-list; single word matching profile→profile; single word matching tool name→1-tool allow-list; single unknown word→error; comma-separated→allow-list. `disabled_tools()` returns the complement set for `disable_route()`. Unknown tool names in lists are warned, not errored. Profiles: `full`(18), `core`(14), `read`(10), `minimal`(6). `ALL_TOOL_NAMES` constant is the single source of truth for all 18 post-consolidation names.
+- **Tool-layer param validation error codes:** `VaultError::Other(...)` maps to `ErrorCode::INTERNAL_ERROR`, not `INVALID_PARAMS`. For parameter validation in tool handlers (invalid action/query/view/type, missing required param), construct `ErrorData::new(ErrorCode::INVALID_PARAMS, msg, None::<serde_json::Value>)` directly. Only use `VaultError` + `?` for errors originating from vault-layer method calls.
 
 ## Links
 

@@ -3,35 +3,23 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, Content, ErrorCode};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::error::VaultError;
 use crate::vault::Vault;
 
-// ── param structs ───────────────────────────────────────────────────
+// ── param struct ────────────────────────────────────────────────────
 
+/// Parameters for the `wikilinks` tool.
 #[derive(Debug, Deserialize, JsonSchema, Default)]
-pub struct LinksBacklinksParams {
-    /// Path to the note (relative to vault root), e.g. `notes/example.md`.
-    pub path: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema, Default)]
-pub struct LinksOutgoingParams {
-    /// Path to the note (relative to vault root), e.g. `notes/example.md`.
-    pub path: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema, Default)]
-pub struct LinksBrokenParams {
-    /// Optional note path to check. If omitted, checks the entire vault.
+pub struct WikilinksParams {
+    /// Query type: `"backlinks"`, `"outgoing"`, `"broken"`, or `"orphans"`.
+    pub query: String,
+    /// Note path (relative to vault root). Required for `"backlinks"` and `"outgoing"`, optional for `"broken"`, unused for `"orphans"`.
     pub path: Option<String>,
 }
-
-#[derive(Debug, Deserialize, JsonSchema, Default)]
-pub struct LinksOrphansParams {}
 
 // ── response types ──────────────────────────────────────────────────
 
@@ -113,12 +101,50 @@ fn is_broken_target(vault: &Vault, target: &str) -> bool {
     !target.is_empty() && vault.resolve_link(target).is_none()
 }
 
-/// Find all notes linking TO a given note, with the specific wikilinks used.
-pub async fn links_backlinks(
+/// Query the vault's wikilink graph: backlinks, outgoing links, broken links, or orphan notes.
+pub async fn wikilinks(
     vault: &Vault,
-    params: LinksBacklinksParams,
+    params: WikilinksParams,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    let path = Path::new(&params.path);
+    if params.query.eq_ignore_ascii_case("backlinks") {
+        let p = params.path.as_deref().ok_or_else(|| {
+            rmcp::ErrorData::new(
+                ErrorCode::INVALID_PARAMS,
+                "'path' is required for query 'backlinks'",
+                None::<serde_json::Value>,
+            )
+        })?;
+        wikilinks_backlinks(vault, p).await
+    } else if params.query.eq_ignore_ascii_case("outgoing") {
+        let p = params.path.as_deref().ok_or_else(|| {
+            rmcp::ErrorData::new(
+                ErrorCode::INVALID_PARAMS,
+                "'path' is required for query 'outgoing'",
+                None::<serde_json::Value>,
+            )
+        })?;
+        wikilinks_outgoing(vault, p).await
+    } else if params.query.eq_ignore_ascii_case("broken") {
+        wikilinks_broken(vault, params.path.as_deref()).await
+    } else if params.query.eq_ignore_ascii_case("orphans") {
+        wikilinks_orphans(vault).await
+    } else {
+        Err(rmcp::ErrorData::new(
+            ErrorCode::INVALID_PARAMS,
+            format!(
+                "Unknown query '{}'. Valid values: \"backlinks\", \"outgoing\", \"broken\", \"orphans\"",
+                params.query
+            ),
+            None::<serde_json::Value>,
+        ))
+    }
+}
+
+async fn wikilinks_backlinks(
+    vault: &Vault,
+    note_path: &str,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    let path = Path::new(note_path);
     vault.get_note_metadata(path)?;
 
     let backlink_notes = vault.backlinks(path)?;
@@ -150,12 +176,11 @@ pub async fn links_backlinks(
     to_json_text(&result)
 }
 
-/// Find all outgoing links FROM a given note, with resolution status.
-pub async fn links_outgoing(
+async fn wikilinks_outgoing(
     vault: &Vault,
-    params: LinksOutgoingParams,
+    note_path: &str,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    let path = Path::new(&params.path);
+    let path = Path::new(note_path);
     vault.get_note_metadata(path)?;
 
     let links = vault.outgoing_links(path)?;
@@ -178,12 +203,11 @@ pub async fn links_outgoing(
     to_json_text(&result)
 }
 
-/// Find all broken (unresolved) wikilinks, optionally filtered to a single note.
-pub async fn links_broken(
+async fn wikilinks_broken(
     vault: &Vault,
-    params: LinksBrokenParams,
+    note_path: Option<&str>,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    let result: Vec<BrokenLink> = match params.path.as_deref() {
+    let result: Vec<BrokenLink> = match note_path {
         Some(p) => {
             let path = Path::new(p);
             vault.get_note_metadata(path)?;
@@ -214,11 +238,7 @@ pub async fn links_broken(
     to_json_text(&result)
 }
 
-/// Find notes disconnected from the resolvable graph.
-pub async fn links_orphans(
-    vault: &Vault,
-    _params: LinksOrphansParams,
-) -> Result<CallToolResult, rmcp::ErrorData> {
+async fn wikilinks_orphans(vault: &Vault) -> Result<CallToolResult, rmcp::ErrorData> {
     let mut disconnected: Vec<OrphanNoteEntry> = vault
         .orphan_notes()?
         .into_iter()
@@ -297,20 +317,44 @@ mod tests {
         std::fs::write(dir.join("orphan.md"), "# Orphan\n\nNo links here.\n").unwrap();
     }
 
+    fn backlinks_params(path: &str) -> WikilinksParams {
+        WikilinksParams {
+            query: "backlinks".into(),
+            path: Some(path.into()),
+            ..Default::default()
+        }
+    }
+
+    fn outgoing_params(path: &str) -> WikilinksParams {
+        WikilinksParams {
+            query: "outgoing".into(),
+            path: Some(path.into()),
+            ..Default::default()
+        }
+    }
+
+    fn broken_params(path: Option<&str>) -> WikilinksParams {
+        WikilinksParams {
+            query: "broken".into(),
+            path: path.map(Into::into),
+            ..Default::default()
+        }
+    }
+
+    fn orphans_params() -> WikilinksParams {
+        WikilinksParams {
+            query: "orphans".into(),
+            ..Default::default()
+        }
+    }
+
     #[tokio::test]
     async fn backlinks_returns_correct_sources_and_refs() {
         let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        let result = links_backlinks(
-            &vault,
-            LinksBacklinksParams {
-                path: "a.md".into(),
-            },
-        )
-        .await
-        .unwrap();
+        let result = wikilinks(&vault, backlinks_params("a.md")).await.unwrap();
         let text = extract_text(&result);
         let backlinks: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
 
@@ -338,14 +382,9 @@ mod tests {
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
         assert!(
-            links_backlinks(
-                &vault,
-                LinksBacklinksParams {
-                    path: "nonexistent.md".into()
-                },
-            )
-            .await
-            .is_err()
+            wikilinks(&vault, backlinks_params("nonexistent.md"))
+                .await
+                .is_err()
         );
     }
 
@@ -355,17 +394,30 @@ mod tests {
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        let result = links_backlinks(
-            &vault,
-            LinksBacklinksParams {
-                path: "orphan.md".into(),
-            },
-        )
-        .await
-        .unwrap();
+        let result = wikilinks(&vault, backlinks_params("orphan.md"))
+            .await
+            .unwrap();
         let text = extract_text(&result);
         let backlinks: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
         assert!(backlinks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn backlinks_missing_path_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+
+        let result = wikilinks(
+            &vault,
+            WikilinksParams {
+                query: "backlinks".into(),
+                path: None,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -374,14 +426,7 @@ mod tests {
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        let result = links_outgoing(
-            &vault,
-            LinksOutgoingParams {
-                path: "a.md".into(),
-            },
-        )
-        .await
-        .unwrap();
+        let result = wikilinks(&vault, outgoing_params("a.md")).await.unwrap();
         let text = extract_text(&result);
         let links: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
         assert_eq!(links.len(), 2);
@@ -399,14 +444,7 @@ mod tests {
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        let result = links_outgoing(
-            &vault,
-            LinksOutgoingParams {
-                path: "d.md".into(),
-            },
-        )
-        .await
-        .unwrap();
+        let result = wikilinks(&vault, outgoing_params("d.md")).await.unwrap();
         let text = extract_text(&result);
         let links: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
 
@@ -423,14 +461,7 @@ mod tests {
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        let result = links_outgoing(
-            &vault,
-            LinksOutgoingParams {
-                path: "c.md".into(),
-            },
-        )
-        .await
-        .unwrap();
+        let result = wikilinks(&vault, outgoing_params("c.md")).await.unwrap();
         let text = extract_text(&result);
         let links: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
         assert_eq!(links.len(), 1);
@@ -447,14 +478,9 @@ mod tests {
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
         assert!(
-            links_outgoing(
-                &vault,
-                LinksOutgoingParams {
-                    path: "nonexistent.md".into()
-                },
-            )
-            .await
-            .is_err()
+            wikilinks(&vault, outgoing_params("nonexistent.md"))
+                .await
+                .is_err()
         );
     }
 
@@ -464,9 +490,7 @@ mod tests {
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        let result = links_broken(&vault, LinksBrokenParams::default())
-            .await
-            .unwrap();
+        let result = wikilinks(&vault, broken_params(None)).await.unwrap();
         let text = extract_text(&result);
         let broken: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
         assert!(!broken.is_empty());
@@ -480,14 +504,9 @@ mod tests {
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        let result = links_broken(
-            &vault,
-            LinksBrokenParams {
-                path: Some("d.md".into()),
-            },
-        )
-        .await
-        .unwrap();
+        let result = wikilinks(&vault, broken_params(Some("d.md")))
+            .await
+            .unwrap();
         let text = extract_text(&result);
         let broken: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
         assert_eq!(broken.len(), 1);
@@ -500,14 +519,9 @@ mod tests {
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        let result = links_broken(
-            &vault,
-            LinksBrokenParams {
-                path: Some("a.md".into()),
-            },
-        )
-        .await
-        .unwrap();
+        let result = wikilinks(&vault, broken_params(Some("a.md")))
+            .await
+            .unwrap();
         let text = extract_text(&result);
         let broken: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
         assert!(broken.is_empty());
@@ -520,14 +534,9 @@ mod tests {
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
         assert!(
-            links_broken(
-                &vault,
-                LinksBrokenParams {
-                    path: Some("nonexistent.md".into()),
-                },
-            )
-            .await
-            .is_err()
+            wikilinks(&vault, broken_params(Some("nonexistent.md")))
+                .await
+                .is_err()
         );
     }
 
@@ -537,7 +546,7 @@ mod tests {
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        let result = links_orphans(&vault, LinksOrphansParams {}).await.unwrap();
+        let result = wikilinks(&vault, orphans_params()).await.unwrap();
         let text = extract_text(&result);
         let orphans: Vec<OrphanNoteEntry> = serde_json::from_str(text).unwrap();
 
@@ -582,7 +591,7 @@ mod tests {
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        let result = links_orphans(&vault, LinksOrphansParams {}).await.unwrap();
+        let result = wikilinks(&vault, orphans_params()).await.unwrap();
         let text = extract_text(&result);
         let orphans: Vec<OrphanNoteEntry> = serde_json::from_str(text).unwrap();
         assert!(
@@ -590,5 +599,22 @@ mod tests {
                 .iter()
                 .any(|entry| entry.path == PathBuf::from("d.md"))
         );
+    }
+
+    #[tokio::test]
+    async fn wikilinks_invalid_query() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+
+        let result = wikilinks(
+            &vault,
+            WikilinksParams {
+                query: "invalid".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(result.is_err());
     }
 }

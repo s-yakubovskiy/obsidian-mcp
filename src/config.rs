@@ -1,6 +1,7 @@
 //! Configuration: env/CLI config for vault path, watch toggle, log level,
 //! transport selection, and optional search features (Tantivy BM25, embeddings).
 
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 
@@ -38,6 +39,168 @@ pub struct Config {
     /// Hybrid search alpha: `alpha * BM25 + (1-alpha) * semantic` (`OBSIDIAN_HYBRID_ALPHA`, default `0.25`).
     /// Clamped to `[0.0, 1.0]`. Lower values give more weight to semantic similarity.
     pub hybrid_alpha: f32,
+    /// Tool filter configuration (`OBSIDIAN_TOOLS`): profile name, allow-list, or deny-list.
+    pub tool_filter: ToolFilter,
+}
+
+// ── Tool Filtering ─────────────────────────────────────────────────
+
+pub const ALL_TOOL_NAMES: &[&str] = &[
+    "vault_list",
+    "note_read",
+    "note_create",
+    "note_write",
+    "note_insert",
+    "note_patch",
+    "note_delete",
+    "note_move",
+    "search_text",
+    "search_regex",
+    "search_metadata",
+    "search_semantic",
+    "note_inspect",
+    "frontmatter",
+    "wikilinks",
+    "periodic",
+    "vault_info",
+    "open_in_obsidian",
+];
+
+const PROFILE_CORE: &[&str] = &[
+    "vault_list",
+    "note_read",
+    "note_create",
+    "note_write",
+    "note_insert",
+    "note_patch",
+    "note_delete",
+    "note_move",
+    "search_text",
+    "search_regex",
+    "search_metadata",
+    "note_inspect",
+    "frontmatter",
+    "vault_info",
+];
+
+const PROFILE_READ: &[&str] = &[
+    "note_read",
+    "vault_list",
+    "search_text",
+    "search_regex",
+    "search_metadata",
+    "search_semantic",
+    "note_inspect",
+    "frontmatter",
+    "wikilinks",
+    "vault_info",
+];
+
+const PROFILE_MINIMAL: &[&str] = &[
+    "note_read",
+    "note_create",
+    "note_write",
+    "vault_list",
+    "search_text",
+    "vault_info",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ToolFilter {
+    #[default]
+    Full,
+    Profile(String),
+    AllowList(HashSet<String>),
+    DenyList(HashSet<String>),
+}
+
+impl ToolFilter {
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Ok(Self::Full);
+        }
+
+        if trimmed.contains('!') {
+            let tools: HashSet<String> = trimmed
+                .split(',')
+                .map(|s| s.trim().trim_start_matches('!').to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            for name in &tools {
+                if !ALL_TOOL_NAMES.contains(&name.as_str()) {
+                    tracing::warn!(tool = %name, "unknown tool name in deny-list, ignoring");
+                }
+            }
+            return Ok(Self::DenyList(tools));
+        }
+
+        if !trimmed.contains(',') {
+            if let Some(profile) = resolve_profile(trimmed) {
+                return Ok(Self::Profile(profile));
+            }
+            if ALL_TOOL_NAMES.contains(&trimmed) {
+                return Ok(Self::AllowList(
+                    std::iter::once(trimmed.to_string()).collect(),
+                ));
+            }
+            return Err(format!(
+                "Unknown profile or tool name '{trimmed}'. Valid profiles: full, core, read, minimal. \
+                 For an allow-list of multiple tools, use comma-separated names."
+            ));
+        }
+
+        let tools: HashSet<String> = trimmed
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        for name in &tools {
+            if !ALL_TOOL_NAMES.contains(&name.as_str()) {
+                tracing::warn!(tool = %name, "unknown tool name in allow-list, ignoring");
+            }
+        }
+        Ok(Self::AllowList(tools))
+    }
+
+    pub fn disabled_tools(&self) -> HashSet<String> {
+        let all: HashSet<&str> = ALL_TOOL_NAMES.iter().copied().collect();
+
+        match self {
+            Self::Full => HashSet::new(),
+            Self::Profile(name) => {
+                let enabled = profile_tools(name);
+                all.iter()
+                    .filter(|t| !enabled.contains(*t))
+                    .map(|t| (*t).to_string())
+                    .collect()
+            }
+            Self::AllowList(allowed) => all
+                .iter()
+                .filter(|t| !allowed.contains(**t))
+                .map(|t| (*t).to_string())
+                .collect(),
+            Self::DenyList(denied) => denied.clone(),
+        }
+    }
+}
+
+fn resolve_profile(name: &str) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
+    match lower.as_str() {
+        "full" | "core" | "read" | "minimal" => Some(lower),
+        _ => None,
+    }
+}
+
+fn profile_tools(name: &str) -> HashSet<&'static str> {
+    match name {
+        "full" => ALL_TOOL_NAMES.iter().copied().collect(),
+        "core" => PROFILE_CORE.iter().copied().collect(),
+        "read" => PROFILE_READ.iter().copied().collect(),
+        "minimal" => PROFILE_MINIMAL.iter().copied().collect(),
+        _ => ALL_TOOL_NAMES.iter().copied().collect(),
+    }
 }
 
 /// Parsed CLI arguments split into flags/values and positional args.
@@ -143,6 +306,11 @@ impl Config {
             .unwrap_or(DEFAULT_HYBRID_ALPHA)
             .clamp(0.0, 1.0);
 
+        let tool_filter = match std::env::var("OBSIDIAN_TOOLS").ok() {
+            Some(raw) if !raw.trim().is_empty() => ToolFilter::parse(raw.trim())?,
+            _ => ToolFilter::Full,
+        };
+
         Ok(Self {
             vault_path,
             watch,
@@ -154,6 +322,7 @@ impl Config {
             embeddings,
             embeddings_model,
             hybrid_alpha,
+            tool_filter,
         })
     }
 }
@@ -363,5 +532,121 @@ mod tests {
         assert_eq!(SemanticMode::Auto.as_str(), "auto");
         assert_eq!(SemanticMode::Daemon.as_str(), "daemon");
         assert_eq!(SemanticMode::Local.as_str(), "local");
+    }
+
+    // ── ToolFilter ────────────────────────────────────────────────
+
+    #[test]
+    fn tool_filter_empty_is_full() {
+        assert_eq!(ToolFilter::parse(""), Ok(ToolFilter::Full));
+        assert_eq!(ToolFilter::parse("  "), Ok(ToolFilter::Full));
+    }
+
+    #[test]
+    fn tool_filter_profile_full() {
+        let filter = ToolFilter::parse("full").unwrap();
+        assert_eq!(filter, ToolFilter::Profile("full".into()));
+        assert!(filter.disabled_tools().is_empty());
+    }
+
+    #[test]
+    fn tool_filter_profile_core() {
+        let filter = ToolFilter::parse("core").unwrap();
+        assert_eq!(filter, ToolFilter::Profile("core".into()));
+        let disabled = filter.disabled_tools();
+        assert_eq!(disabled.len(), ALL_TOOL_NAMES.len() - PROFILE_CORE.len());
+        assert!(disabled.contains("search_semantic"));
+        assert!(disabled.contains("wikilinks"));
+        assert!(disabled.contains("periodic"));
+        assert!(disabled.contains("open_in_obsidian"));
+        assert!(!disabled.contains("note_read"));
+    }
+
+    #[test]
+    fn tool_filter_profile_read() {
+        let filter = ToolFilter::parse("read").unwrap();
+        assert_eq!(filter, ToolFilter::Profile("read".into()));
+        let disabled = filter.disabled_tools();
+        assert_eq!(disabled.len(), ALL_TOOL_NAMES.len() - PROFILE_READ.len());
+        assert!(disabled.contains("note_create"));
+        assert!(disabled.contains("note_write"));
+        assert!(!disabled.contains("note_read"));
+        assert!(!disabled.contains("search_semantic"));
+    }
+
+    #[test]
+    fn tool_filter_profile_minimal() {
+        let filter = ToolFilter::parse("minimal").unwrap();
+        assert_eq!(filter, ToolFilter::Profile("minimal".into()));
+        let disabled = filter.disabled_tools();
+        assert_eq!(disabled.len(), ALL_TOOL_NAMES.len() - PROFILE_MINIMAL.len());
+        assert!(disabled.contains("search_regex"));
+        assert!(disabled.contains("wikilinks"));
+        assert!(!disabled.contains("note_read"));
+        assert!(!disabled.contains("vault_list"));
+    }
+
+    #[test]
+    fn tool_filter_case_insensitive_profile() {
+        assert_eq!(
+            ToolFilter::parse("CORE").unwrap(),
+            ToolFilter::Profile("core".into())
+        );
+        assert_eq!(
+            ToolFilter::parse("Read").unwrap(),
+            ToolFilter::Profile("read".into())
+        );
+    }
+
+    #[test]
+    fn tool_filter_allow_list() {
+        let filter = ToolFilter::parse("note_read,vault_list").unwrap();
+        let expected: HashSet<String> = ["note_read", "vault_list"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(filter, ToolFilter::AllowList(expected));
+        let disabled = filter.disabled_tools();
+        assert_eq!(disabled.len(), ALL_TOOL_NAMES.len() - 2);
+        assert!(!disabled.contains("note_read"));
+        assert!(!disabled.contains("vault_list"));
+        assert!(disabled.contains("note_create"));
+    }
+
+    #[test]
+    fn tool_filter_single_valid_tool_is_allow_list() {
+        let filter = ToolFilter::parse("note_read").unwrap();
+        let expected: HashSet<String> = std::iter::once("note_read".to_string()).collect();
+        assert_eq!(filter, ToolFilter::AllowList(expected));
+    }
+
+    #[test]
+    fn tool_filter_deny_list() {
+        let filter = ToolFilter::parse("!open_in_obsidian,!wikilinks").unwrap();
+        let expected: HashSet<String> = ["open_in_obsidian", "wikilinks"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(filter, ToolFilter::DenyList(expected));
+        let disabled = filter.disabled_tools();
+        assert_eq!(disabled.len(), 2);
+        assert!(disabled.contains("open_in_obsidian"));
+        assert!(disabled.contains("wikilinks"));
+    }
+
+    #[test]
+    fn tool_filter_unknown_single_word_errors() {
+        let result = ToolFilter::parse("nonexistent");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("Valid profiles"));
+    }
+
+    #[test]
+    fn tool_filter_deny_list_with_unknown_tool() {
+        let filter = ToolFilter::parse("!fake_tool,!note_read").unwrap();
+        let disabled = filter.disabled_tools();
+        assert!(disabled.contains("fake_tool"));
+        assert!(disabled.contains("note_read"));
     }
 }
