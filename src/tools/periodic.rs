@@ -13,7 +13,7 @@ fn parse_date(date_str: &str) -> Result<NaiveDate, rmcp::ErrorData> {
         rmcp::ErrorData::new(
             ErrorCode::INVALID_PARAMS,
             format!("Invalid date '{date_str}'; expected YYYY-MM-DD"),
-            None,
+            None::<serde_json::Value>,
         )
     })
 }
@@ -63,13 +63,18 @@ pub async fn periodic(vault: &Vault, params: PeriodicParams) -> Result<String, r
                 })
                 .collect();
 
-            serde_json::to_string_pretty(&items)
-                .map_err(|e| rmcp::ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))
+            serde_json::to_string_pretty(&items).map_err(|e| {
+                rmcp::ErrorData::new(
+                    ErrorCode::INTERNAL_ERROR,
+                    e.to_string(),
+                    None::<serde_json::Value>,
+                )
+            })
         }
         other => Err(rmcp::ErrorData::new(
             ErrorCode::INVALID_PARAMS,
             format!("Unknown action '{other}'. Valid values: \"get\", \"create\", \"list\""),
-            None,
+            None::<serde_json::Value>,
         )),
     }
 }
