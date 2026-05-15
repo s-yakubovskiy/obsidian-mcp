@@ -27,7 +27,7 @@ obsidian-mcp /path/to/your/vault
 obsidian-mcp --http /path/to/your/vault
 ```
 
-Add to your MCP client config (Cursor, Claude Desktop, etc.) and you're done — 29 tools are available immediately.
+Add to your MCP client config (Cursor, Claude Desktop, etc.) and you're done — 18 tools are available immediately.
 
 ## What It Can Do
 
@@ -266,19 +266,18 @@ Always available. Full regex syntax for pattern matching across all notes.
 | Conceptual — "notes about X" | `search_semantic` |
 | Best precision + recall | `search_semantic` + `lexical_prefetch: true` |
 | Structural pattern (URLs, IDs) | `search_regex` |
-| By tag or metadata | `search_tag` / `search_frontmatter` |
+| By tag or metadata | `search_metadata` |
 
 ## Tool Reference
 
 <details>
-<summary><strong>All 29 tools</strong> (click to expand)</summary>
+<summary><strong>All 18 tools</strong> (click to expand)</summary>
 
 ### Navigation
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| `vault_list` | `path?`, `recursive?`, `glob?` | List files and directories |
-| `vault_structure` | `path?`, `max_depth?` | Tree view of vault structure |
+| `vault_list` | `path?`, `recursive?`, `glob?`, `format?`, `max_depth?` | List files (`format: "list"`) or tree view (`format: "tree"`) |
 | `vault_info` | — | Aggregate vault statistics |
 
 ### Note CRUD
@@ -288,8 +287,7 @@ Always available. Full regex syntax for pattern matching across all notes.
 | `note_read` | `path` | Read full note content |
 | `note_create` | `path`, `content?`, `frontmatter?` | Create a new note |
 | `note_write` | `path`, `content` | Overwrite note content |
-| `note_append` | `path`, `content` | Append to end of note |
-| `note_prepend` | `path`, `content` | Insert after frontmatter |
+| `note_insert` | `path`, `content`, `position?` | Insert at end (`"end"`, default) or beginning (`"beginning"`) |
 | `note_patch` | `path`, `operation`, `target_type`, `target`, `content` | Patch a heading section, block ref, or frontmatter field |
 | `note_delete` | `path`, `confirm` | Delete a note (requires `confirm: true`) |
 | `note_move` | `from`, `to` | Move or rename a note |
@@ -301,35 +299,26 @@ Always available. Full regex syntax for pattern matching across all notes.
 | `search_text` | `query`, `fuzzy?`, `fields?`, `context_length?`, `max_results?` | BM25 full-text search with stemming |
 | `search_semantic` | `query`, `top_k?`, `include_content?`, `lexical_prefetch?`, `alpha?` | Semantic similarity search |
 | `search_regex` | `pattern`, `context_length?`, `max_results?` | Regex pattern search |
-| `search_tag` | `tag`, `include_nested?` | Find notes by tag |
-| `search_frontmatter` | `field`, `value?`, `operator` | Query by frontmatter field |
+| `search_metadata` | `type`, `tag?`, `include_nested?`, `field?`, `value?`, `operator?` | Find by tag (`type: "tag"`) or frontmatter (`type: "frontmatter"`) |
 
-### Metadata & Frontmatter
+### Introspection & Frontmatter
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| `note_metadata` | `path` | Tags, headings, links, word count, dates |
-| `note_document_map` | `path` | List patchable targets (headings, blocks, fields) |
-| `frontmatter_get` | `path` | Read frontmatter as JSON |
-| `frontmatter_set` | `path`, `key`, `value` | Set a frontmatter field |
-| `frontmatter_remove` | `path`, `key` | Remove a frontmatter field |
+| `note_inspect` | `path`, `view?` | Metadata (`"metadata"`, default) or patchable targets (`"targets"`) |
+| `frontmatter` | `action`, `path`, `key?`, `value?` | Get (`"get"`), set (`"set"`), or remove (`"remove"`) frontmatter fields |
 
 ### Graph & Links
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| `links_backlinks` | `path` | Notes linking to this note |
-| `links_outgoing` | `path` | Outgoing wikilinks with resolution status |
-| `links_broken` | `path?` | Broken wikilinks (vault-wide or single note) |
-| `links_orphans` | — | Notes disconnected from the resolvable graph (no links, or only broken outgoing links) |
+| `wikilinks` | `query`, `path?` | Backlinks, outgoing, broken, or orphans (`query: "backlinks"/"outgoing"/"broken"/"orphans"`) |
 
 ### Periodic Notes
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| `periodic_get` | `period`, `date?` | Read a periodic note |
-| `periodic_create` | `period`, `date?`, `content?` | Create a periodic note from template |
-| `periodic_list_recent` | `period`, `limit?` | List recent periodic notes |
+| `periodic` | `action`, `period`, `date?`, `content?`, `limit?` | Get, create, or list periodic notes (`action: "get"/"create"/"list"`) |
 
 ### Utility
 
@@ -338,6 +327,19 @@ Always available. Full regex syntax for pattern matching across all notes.
 | `open_in_obsidian` | `path`, `new_leaf?` | Open note in Obsidian via `obsidian://` URI |
 
 </details>
+
+## Tool Filtering
+
+Control which tools are exposed via the `OBSIDIAN_TOOLS` environment variable or per-session `X-Obsidian-Tools` HTTP header.
+
+| Value | Effect |
+|-------|--------|
+| `full` (or unset) | All 18 tools |
+| `core` | 14 tools — drops `search_semantic`, `search_regex`, `periodic`, `open_in_obsidian` |
+| `read` | 10 tools — read-only (no create/write/insert/patch/delete/move) |
+| `minimal` | 6 tools — `vault_list`, `vault_info`, `note_read`, `note_create`, `note_write`, `search_text` |
+| `tool1,tool2,...` | Allow-list — only the named tools |
+| `!tool1,!tool2,...` | Deny-list — all tools except the named ones |
 
 ## Configuration
 
@@ -350,6 +352,7 @@ Always available. Full regex syntax for pattern matching across all notes.
 | `OBSIDIAN_WATCH` | No | `true` | Filesystem watcher for live index updates |
 | `OBSIDIAN_LOG_LEVEL` | No | `info` | `trace`, `debug`, `info`, `warn`, `error` |
 | `OBSIDIAN_TANTIVY` | No | `true` | BM25 full-text index |
+| `OBSIDIAN_TOOLS` | No | `full` | Tool filtering: profile name, comma-separated allow-list, or `!`-prefixed deny-list |
 | `OBSIDIAN_EMBEDDINGS` | No | `false` | Semantic embedding search (requires `embeddings` feature) |
 | `OBSIDIAN_EMBEDDINGS_MODEL` | No | `BAAI/bge-small-en-v1.5` | HuggingFace model for embeddings |
 | `OBSIDIAN_SEMANTIC_MODE` | No | `auto` | Semantic backend mode: `auto`, `daemon`, `local` |
