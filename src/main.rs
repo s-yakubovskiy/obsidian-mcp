@@ -384,21 +384,38 @@ fn print_help() {
 }
 
 /// Spawn a detached child running `--http` and exit the parent.
+/// Kills any existing server on the target port first.
 fn daemonize() -> Result<(), Box<dyn std::error::Error>> {
     let exe = std::env::current_exe()?;
 
     let mut child_args = vec!["--http".to_string()];
+    let mut port: u16 = 37842;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "serve" {
             continue;
         }
         let takes_value = arg == "--port" || arg == "--host";
-        child_args.push(arg);
         if takes_value && let Some(val) = args.next() {
+            if arg == "--port"
+                && let Ok(p) = val.parse()
+            {
+                port = p;
+            }
+            child_args.push(arg);
             child_args.push(val);
+        } else {
+            child_args.push(arg);
         }
     }
+    if port == 37842
+        && let Ok(val) = std::env::var("OBSIDIAN_HTTP_PORT")
+        && let Ok(p) = val.parse()
+    {
+        port = p;
+    }
+
+    stop_existing_server(port)?;
 
     let log_file = daemon_log_path()?;
     if let Some(parent) = log_file.parent() {
@@ -447,6 +464,131 @@ fn daemonize() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
     }
+}
+
+/// Stop all servers on `port`. Returns `Err` if the port cannot be freed.
+fn stop_existing_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+
+    for round in 0..5 {
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err() {
+            return Ok(());
+        }
+
+        let Some(pid) = find_pid_on_port(port) else {
+            if round == 0 {
+                return Err(format!(
+                    "port {port} is already in use but could not identify the process"
+                )
+                .into());
+            }
+            std::thread::sleep(Duration::from_secs(1));
+            if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err() {
+                return Ok(());
+            }
+            return Err(format!("port {port} is still in use").into());
+        };
+
+        if pid == std::process::id() {
+            return Ok(());
+        }
+
+        println!("stopping existing server on port {port} (PID {pid})");
+        stop_process(pid)?;
+    }
+
+    if TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_err() {
+        return Ok(());
+    }
+    Err(format!("port {port} is still in use after stopping 5 processes").into())
+}
+
+fn stop_process(pid: u32) -> Result<(), Box<dyn std::error::Error>> {
+    send_signal(pid, false);
+    if !wait_for_process_exit(pid, 50) {
+        println!("process did not exit after SIGTERM, sending SIGKILL (PID {pid})");
+        send_signal(pid, true);
+        if !wait_for_process_exit(pid, 20) {
+            return Err(format!("could not stop process (PID {pid})").into());
+        }
+    }
+    Ok(())
+}
+
+fn wait_for_process_exit(pid: u32, ticks: u32) -> bool {
+    for _ in 0..ticks {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if !is_process_alive(pid) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(unix)]
+fn is_process_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+#[cfg(windows)]
+fn is_process_alive(pid: u32) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
+}
+
+#[cfg(unix)]
+fn find_pid_on_port(port: u16) -> Option<u32> {
+    let output = std::process::Command::new("lsof")
+        .args(["-ti", &format!("tcp:{port}")])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .filter_map(|s| s.parse::<u32>().ok())
+        .find(|&pid| pid != std::process::id())
+}
+
+#[cfg(windows)]
+fn find_pid_on_port(port: u16) -> Option<u32> {
+    let output = std::process::Command::new("netstat")
+        .args(["-ano"])
+        .output()
+        .ok()?;
+    let needle = format!(":{port}");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|l| l.contains(&needle) && l.contains("LISTENING"))
+        .find_map(|l| l.split_whitespace().last()?.parse::<u32>().ok())
+        .filter(|&pid| pid != std::process::id())
+}
+
+#[cfg(unix)]
+fn send_signal(pid: u32, force: bool) {
+    let sig = if force { "-KILL" } else { "-TERM" };
+    let _ = std::process::Command::new("kill")
+        .args([sig, &pid.to_string()])
+        .status();
+}
+
+#[cfg(windows)]
+fn send_signal(pid: u32, force: bool) {
+    let mut args = vec!["/PID".to_string(), pid.to_string()];
+    if force {
+        args.push("/F".to_string());
+    }
+    let _ = std::process::Command::new("taskkill").args(&args).status();
 }
 
 fn daemon_log_path() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
