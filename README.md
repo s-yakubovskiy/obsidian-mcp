@@ -167,10 +167,10 @@ A persistent HTTP server that multiple clients can connect to simultaneously.
 **Use when:** you run multiple headless agents (`cursor agent -p`, parallel Claude sessions, etc.) against the same vault and want to share a single server process instead of spawning one per agent.
 
 ```sh
-# Foreground (for development / process managers)
+# Foreground (for development / process managers like launchd, systemd)
 obsidian-mcp --http /path/to/vault
 
-# Background (daemonize — spawns child, parent exits)
+# Background (ad-hoc daemonize — spawns child, parent exits)
 obsidian-mcp serve /path/to/vault
 ```
 
@@ -194,6 +194,17 @@ obsidian-mcp --http --port 9000 --host 0.0.0.0 /path/to/vault
 # or via env vars
 OBSIDIAN_TRANSPORT=http OBSIDIAN_HTTP_PORT=9000 obsidian-mcp /path/to/vault
 ```
+
+### Server Management
+
+```sh
+obsidian-mcp serve /path/to/vault    # Start HTTP server in background
+obsidian-mcp stop                    # Stop running server (default port)
+obsidian-mcp stop --port 9000        # Stop server on specific port
+obsidian-mcp restart /path/to/vault  # Stop + start (picks up new binary after upgrade)
+```
+
+`serve` and `restart` wait for the server to pass a `/health` check before reporting success (up to 15s). If the server fails during startup, the exit code and log path are reported.
 
 ## Client Setup
 
@@ -257,6 +268,134 @@ Config file location:
 ### Any MCP client
 
 obsidian-mcp supports both **stdio** and **Streamable HTTP** MCP transports. Any MCP-compatible client can connect via either method. Pass the vault path as the first argument or via `OBSIDIAN_VAULT_PATH`.
+
+## Running as a Service
+
+For always-on HTTP mode, use your OS process manager with `--http` (not `serve`). This lets the process manager handle restarts, logging, and lifecycle — `serve` daemonizes itself, which conflicts with process managers that expect to own the child process.
+
+### macOS (launchd)
+
+Create `~/Library/LaunchAgents/com.obsidian-mcp.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.obsidian-mcp</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/YOU/.cargo/bin/obsidian-mcp</string>
+    <string>--http</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>OBSIDIAN_VAULT_PATH</key>
+    <string>/path/to/your/vault</string>
+    <!-- Add embedding env vars here if using API embeddings:
+    <key>OBSIDIAN_EMBEDDINGS</key>
+    <string>true</string>
+    <key>OBSIDIAN_EMBEDDING_PROVIDER</key>
+    <string>api</string>
+    <key>OBSIDIAN_EMBEDDING_API_KEY</key>
+    <string>sk-...</string>
+    <key>OBSIDIAN_EMBEDDING_API_BASE</key>
+    <string>https://api.openai.com/v1</string>
+    <key>OBSIDIAN_EMBEDDING_API_MODEL</key>
+    <string>text-embedding-3-small</string>
+    -->
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/YOU/Library/Logs/obsidian-mcp/launchd.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/YOU/Library/Logs/obsidian-mcp/launchd.err.log</string>
+</dict>
+</plist>
+```
+
+> **Important:** launchd does not source your shell profile (`~/.zshrc`, `~/.bashrc`). All environment variables must be defined in the plist's `EnvironmentVariables` section.
+
+```sh
+# Load
+launchctl load ~/Library/LaunchAgents/com.obsidian-mcp.plist
+
+# Unload (stop)
+launchctl unload ~/Library/LaunchAgents/com.obsidian-mcp.plist
+
+# Restart (after upgrade)
+launchctl unload ~/Library/LaunchAgents/com.obsidian-mcp.plist && \
+  launchctl load ~/Library/LaunchAgents/com.obsidian-mcp.plist
+```
+
+### Linux (systemd)
+
+Create `~/.config/systemd/user/obsidian-mcp.service`:
+
+```ini
+[Unit]
+Description=obsidian-mcp MCP server
+After=network.target
+
+[Service]
+ExecStart=%h/.cargo/bin/obsidian-mcp --http
+Environment=OBSIDIAN_VAULT_PATH=/path/to/your/vault
+# Add embedding env vars if needed:
+# Environment=OBSIDIAN_EMBEDDINGS=true
+# Environment=OBSIDIAN_EMBEDDING_PROVIDER=api
+# Environment=OBSIDIAN_EMBEDDING_API_KEY=sk-...
+# Environment=OBSIDIAN_EMBEDDING_API_BASE=https://api.openai.com/v1
+# Environment=OBSIDIAN_EMBEDDING_API_MODEL=text-embedding-3-small
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now obsidian-mcp
+
+# Check status
+systemctl --user status obsidian-mcp
+
+# Restart (after upgrade)
+systemctl --user restart obsidian-mcp
+
+# View logs
+journalctl --user -u obsidian-mcp -f
+```
+
+## Upgrading
+
+```sh
+# Install new version
+cargo install obsidian-mcp --force
+# With features:
+cargo install obsidian-mcp --features embeddings,embeddings-api --force
+
+# Restart the running server to pick up the new binary
+obsidian-mcp restart /path/to/vault
+
+# Or if using a process manager:
+launchctl unload ~/Library/LaunchAgents/com.obsidian-mcp.plist && \
+  launchctl load ~/Library/LaunchAgents/com.obsidian-mcp.plist
+# systemd: systemctl --user restart obsidian-mcp
+```
+
+> `cargo install --force` replaces the binary on disk but does **not** restart any running server. You must restart manually — otherwise the old version continues serving.
 
 ## Search
 

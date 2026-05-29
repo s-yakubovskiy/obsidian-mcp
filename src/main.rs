@@ -17,6 +17,8 @@ use obsidian_mcp::error::VaultError;
 use obsidian_mcp::tools::{ObsidianMcp, SemanticRuntime};
 use obsidian_mcp::vault::Vault;
 
+const DEFAULT_PORT: u16 = 37842;
+
 tokio::task_local! {
     static SESSION_DISABLED_TOOLS: HashSet<String>;
 }
@@ -95,6 +97,7 @@ async fn serve_http(
     mcp_config.stateful_mode = true;
     mcp_config.json_response = true;
 
+    let health_vault = vault.clone();
     let mcp_service: StreamableHttpService<ObsidianMcp, LocalSessionManager> =
         StreamableHttpService::new(
             move || {
@@ -120,7 +123,7 @@ async fn serve_http(
         .layer(middleware::from_fn(tool_filter_middleware));
 
     let app = Router::new()
-        .route("/health", get(health_handler))
+        .route("/health", get(move || health_handler(health_vault.clone())))
         .merge(mcp_router);
 
     let addr = std::net::SocketAddr::new(config.http_host, config.http_port);
@@ -159,12 +162,28 @@ async fn tool_filter_middleware(
         .await
 }
 
-async fn health_handler() -> axum::Json<serde_json::Value> {
-    axum::Json(serde_json::json!({
+async fn health_handler(vault: Vault) -> axum::Json<serde_json::Value> {
+    let stats = vault.vault_stats().ok();
+    let note_count = stats.as_ref().map(|s| s.total_notes);
+
+    #[allow(unused_mut)]
+    let mut resp = serde_json::json!({
         "status": "ok",
         "server": env!("CARGO_PKG_NAME"),
         "version": env!("CARGO_PKG_VERSION"),
-    }))
+        "notes": note_count,
+    });
+
+    #[cfg(has_embeddings)]
+    {
+        let embeddings_ready = vault.has_embeddings();
+        resp["embeddings_ready"] = serde_json::json!(embeddings_ready);
+        if let Some(err) = vault.embedding_load_error() {
+            resp["embeddings_error"] = serde_json::json!(err);
+        }
+    }
+
+    axum::Json(resp)
 }
 
 async fn shutdown_signal() {
@@ -324,12 +343,25 @@ fn handle_cli_flags() -> Option<i32> {
             print_help();
             Some(0)
         }
-        "serve" => {
-            if std::env::args().any(|a| a == "--help" || a == "-h") {
+        "serve" | "stop" | "restart" => {
+            if subcommand_wants_help() {
                 print_help();
                 return Some(0);
             }
-            match daemonize() {
+            let result = match arg.as_str() {
+                "stop" => {
+                    let port = resolve_port_from_args();
+                    if !is_port_in_use(port) {
+                        println!("no server running on port {port}");
+                        return Some(0);
+                    }
+                    stop_existing_server(port).map(|()| {
+                        println!("server on port {port} stopped");
+                    })
+                }
+                _ => daemonize(),
+            };
+            match result {
                 Ok(()) => Some(0),
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -341,6 +373,10 @@ fn handle_cli_flags() -> Option<i32> {
     }
 }
 
+fn subcommand_wants_help() -> bool {
+    std::env::args().any(|a| a == "--help" || a == "-h")
+}
+
 fn print_help() {
     println!(
         "{name} {version} — {description}\n\
@@ -348,9 +384,11 @@ fn print_help() {
          USAGE:\n    \
              {name} [OPTIONS] [VAULT_PATH]          Run with stdio transport (default)\n    \
              {name} --http [OPTIONS] [VAULT_PATH]   Run with Streamable HTTP transport\n    \
-             {name} serve [OPTIONS] [VAULT_PATH]    Start HTTP server in background\n\
+             {name} serve [OPTIONS] [VAULT_PATH]    Start HTTP server in background\n    \
+             {name} stop [--port PORT]              Stop a running HTTP server\n    \
+             {name} restart [OPTIONS] [VAULT_PATH]  Restart HTTP server (stop + serve)\n\
          \n\
-         The 'serve' command daemonizes and logs to a platform-specific file:\n    \
+         The 'serve' and 'restart' commands daemonize and log to a platform-specific file:\n    \
              macOS:   ~/Library/Logs/obsidian-mcp.log\n    \
              Linux:   $XDG_STATE_HOME/obsidian-mcp/obsidian-mcp.log\n    \
              Windows: %LOCALAPPDATA%/obsidian-mcp/obsidian-mcp.log\n\
@@ -391,38 +429,50 @@ fn print_help() {
     );
 }
 
+/// Resolve the HTTP port from CLI args and env, skipping subcommand names.
+fn resolve_port_from_args() -> u16 {
+    let mut port = DEFAULT_PORT;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--port"
+            && let Some(val) = args.next()
+            && let Ok(p) = val.parse()
+        {
+            port = p;
+        }
+    }
+    if port == DEFAULT_PORT
+        && let Ok(val) = std::env::var("OBSIDIAN_HTTP_PORT")
+        && let Ok(p) = val.parse()
+    {
+        port = p;
+    }
+    port
+}
+
 /// Spawn a detached child running `--http` and exit the parent.
 /// Kills any existing server on the target port first.
 fn daemonize() -> Result<(), Box<dyn std::error::Error>> {
     let exe = std::env::current_exe()?;
 
     let mut child_args = vec!["--http".to_string()];
-    let mut port: u16 = 37842;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        if arg == "serve" {
+        if arg == "serve" || arg == "restart" {
             continue;
         }
         let takes_value = arg == "--port" || arg == "--host";
-        if takes_value && let Some(val) = args.next() {
-            if arg == "--port"
-                && let Ok(p) = val.parse()
-            {
-                port = p;
+        if takes_value {
+            if let Some(val) = args.next() {
+                child_args.push(arg);
+                child_args.push(val);
             }
-            child_args.push(arg);
-            child_args.push(val);
         } else {
             child_args.push(arg);
         }
     }
-    if port == 37842
-        && let Ok(val) = std::env::var("OBSIDIAN_HTTP_PORT")
-        && let Ok(p) = val.parse()
-    {
-        port = p;
-    }
 
+    let port = resolve_port_from_args();
     stop_existing_server(port)?;
 
     let log_file = daemon_log_path()?;
@@ -447,31 +497,83 @@ fn daemonize() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut child = cmd.spawn()?;
+    let child_pid = child.id();
 
-    std::thread::sleep(std::time::Duration::from_millis(150));
-
-    match child.try_wait()? {
-        Some(status) if !status.success() => Err(format!(
-            "server exited immediately (exit code: {})\ncheck logs: {}",
-            status,
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    if let Some(status) = child.try_wait()? {
+        return Err(format!(
+            "server exited immediately (exit code: {status})\ncheck logs: {}",
             log_file.display()
         )
-        .into()),
-        Some(_) => Err(format!(
-            "server exited immediately\ncheck logs: {}",
-            log_file.display()
-        )
-        .into()),
-        None => {
-            eprintln!(
-                "{name} HTTP server started (PID {pid})\nlogs: {log}",
-                name = env!("CARGO_PKG_NAME"),
-                pid = child.id(),
-                log = log_file.display(),
-            );
-            Ok(())
+        .into());
+    }
+
+    let mut healthy = false;
+    for tick in 0..60 {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        if let Some(status) = child.try_wait()? {
+            return Err(format!(
+                "server exited during startup (exit code: {status})\ncheck logs: {}",
+                log_file.display()
+            )
+            .into());
+        }
+        if probe_health(port) {
+            healthy = true;
+            break;
+        }
+        if tick == 19 {
+            eprintln!("waiting for server to become healthy…");
         }
     }
+
+    if healthy {
+        eprintln!(
+            "{name} {version} HTTP server started (PID {pid})\nlogs: {log}",
+            name = env!("CARGO_PKG_NAME"),
+            version = env!("CARGO_PKG_VERSION"),
+            pid = child_pid,
+            log = log_file.display(),
+        );
+        Ok(())
+    } else {
+        Err(format!(
+            "server started (PID {child_pid}) but /health not responding after 15s\n\
+             check logs: {}",
+            log_file.display()
+        )
+        .into())
+    }
+}
+
+fn is_port_in_use(port: u16) -> bool {
+    use std::net::{SocketAddr, TcpStream};
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200)).is_ok()
+}
+
+fn probe_health(port: u16) -> bool {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500))
+    else {
+        return false;
+    };
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+        .ok();
+    let req = "GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n";
+    if stream.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 512];
+    let Ok(n) = stream.read(&mut buf) else {
+        return false;
+    };
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    resp.contains("200") && resp.contains("\"status\":\"ok\"")
 }
 
 /// Stop all servers on `port`. Returns `Err` if the port cannot be freed.
