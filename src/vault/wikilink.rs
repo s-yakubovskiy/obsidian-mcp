@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use super::path::canonical_unicode_key;
+
 /// Resolves wikilink targets to file paths using Obsidian's
 /// shortest-unique-path algorithm.
 ///
@@ -108,36 +110,38 @@ impl LinkResolver {
     }
 
     /// Normalize a wikilink target for lookup:
-    /// strip trailing `.md`, normalize path separators, lowercase.
+    /// Unicode-normalize, strip trailing `.md`, normalize path separators, lowercase.
     fn normalize_target(target: &str) -> String {
-        lowercase_without_md(&target.replace('\\', "/"))
+        lookup_key_without_md(&target.replace('\\', "/"))
     }
 
     /// Compute the path-based lookup key for a vault-relative path.
     /// `.md` files: path without `.md`, lowercased.
     /// Other files: full path, lowercased.
     fn path_key(path: &Path) -> String {
-        lowercase_without_md(&path.to_string_lossy().replace('\\', "/"))
+        lookup_key_without_md(&path.to_string_lossy().replace('\\', "/"))
     }
 
     /// Compute the stem-based lookup key for a vault-relative path.
     /// `.md` files: filename without `.md`, lowercased.
     /// Other files: full filename with extension, lowercased.
     fn stem_key(path: &Path) -> String {
-        lowercase_without_md(&path.file_name().unwrap_or_default().to_string_lossy())
+        lookup_key_without_md(&path.file_name().unwrap_or_default().to_string_lossy())
     }
 }
 
-/// Lowercase then strip `.md` suffix (if present).
+/// Normalize to NFC, lowercase, then strip `.md` suffix (if present).
 /// Lowercasing first ensures case-insensitive `.md`/`.MD`/`.Md` stripping.
-fn lowercase_without_md(s: &str) -> String {
-    let lower = s.to_lowercase();
+fn lookup_key_without_md(s: &str) -> String {
+    let normalized = canonical_unicode_key(s);
+    let lower = normalized.to_lowercase();
     lower.strip_suffix(".md").map(String::from).unwrap_or(lower)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unicode_normalization::UnicodeNormalization;
 
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)
@@ -195,6 +199,48 @@ mod tests {
     fn path_miss_returns_none() {
         let r = build_link_resolver(&paths(&["notes/hello.md"]));
         assert_eq!(r.resolve("wrong/hello"), None);
+    }
+
+    #[test]
+    fn stem_resolves_across_unicode_normalization_forms() {
+        let composed = "знаний.md";
+        let decomposed: String = composed.nfd().collect();
+        let decomposed_path = PathBuf::from(format!("notes/{decomposed}"));
+        let r = build_link_resolver(std::slice::from_ref(&decomposed_path));
+
+        assert_eq!(r.resolve("знаний"), Some(decomposed_path));
+    }
+
+    #[test]
+    fn stem_resolves_from_decomposed_target_to_composed_path() {
+        let composed_path = p("notes/знаний.md");
+        let decomposed_target: String = "знаний".nfd().collect();
+        let r = build_link_resolver(std::slice::from_ref(&composed_path));
+
+        assert_eq!(r.resolve(&decomposed_target), Some(composed_path));
+    }
+
+    #[test]
+    fn normalized_stem_ambiguity_returns_none() {
+        let composed_path = p("notes/café.md");
+        let decomposed: String = "café.md".nfd().collect();
+        let decomposed_path = PathBuf::from(format!("archive/{decomposed}"));
+        let r = build_link_resolver(&[composed_path, decomposed_path]);
+
+        assert_eq!(r.resolve("café"), None);
+    }
+
+    #[test]
+    fn path_resolves_across_unicode_normalization_forms() {
+        let composed = "02_База-знаний/Сущности/lic1c.md";
+        let decomposed: String = composed.nfd().collect();
+        let decomposed_path = PathBuf::from(&decomposed);
+        let r = build_link_resolver(std::slice::from_ref(&decomposed_path));
+
+        assert_eq!(
+            r.resolve("02_База-знаний/Сущности/lic1c"),
+            Some(decomposed_path)
+        );
     }
 
     // -- case insensitivity --

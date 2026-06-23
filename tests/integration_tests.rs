@@ -614,6 +614,105 @@ mod vault_write {
     }
 }
 
+// ── Unicode path normalization ──────────────────────────────────────────
+
+mod unicode_paths {
+    use super::*;
+    use unicode_normalization::UnicodeNormalization;
+
+    fn unicode_config(vault_root: &Path) -> Config {
+        Config {
+            vault_path: vault_root.to_path_buf(),
+            watch: false,
+            log_level: "error".into(),
+            transport: obsidian_mcp::config::Transport::Stdio,
+            http_host: obsidian_mcp::config::DEFAULT_HTTP_HOST,
+            http_port: obsidian_mcp::config::DEFAULT_HTTP_PORT,
+            tantivy: true,
+            embeddings: false,
+            embeddings_model: String::new(),
+            hybrid_alpha: 0.25,
+            embedding_provider: None,
+            tool_filter: ToolFilter::Full,
+            mcp_data_dir: None,
+            exclude_patterns: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn canonically_equivalent_unicode_paths_work_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".obsidian")).unwrap();
+
+        let composed = "02_База-знаний/Сущности/lic1c.md";
+        let composed_link_target = "02_База-знаний/Сущности/lic1c";
+        let decomposed: String = composed.nfd().collect();
+        let disk_path = PathBuf::from(&decomposed);
+        std::fs::create_dir_all(dir.path().join(disk_path.parent().unwrap())).unwrap();
+        std::fs::write(
+            dir.path().join(&disk_path),
+            "# License\n\ninitial-unicode-token\n\nLinks to [[source]].\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("source.md"),
+            format!("# Source\n\nLinks to [[{composed_link_target}]].\n"),
+        )
+        .unwrap();
+
+        let vault = Vault::open(&unicode_config(dir.path())).await.unwrap();
+
+        let content = vault.read_note(Path::new(composed)).unwrap();
+        assert!(content.contains("initial-unicode-token"));
+
+        let metadata = vault.get_note_metadata(Path::new(composed)).unwrap();
+        assert_eq!(metadata.path, disk_path);
+
+        let backlinks = vault.backlinks(Path::new(composed)).unwrap();
+        assert!(
+            backlinks
+                .iter()
+                .any(|note| note.path == PathBuf::from("source.md"))
+        );
+
+        let outgoing = vault.outgoing_links(Path::new(composed)).unwrap();
+        assert!(outgoing.iter().any(|link| link.target == "source"));
+
+        let initial_results = vault.search_text("initial-unicode-token", 40).unwrap();
+        assert_eq!(initial_results.len(), 1);
+        assert_eq!(initial_results[0].path, disk_path);
+
+        vault
+            .append_note(Path::new(composed), "\nappended-unicode-token\n")
+            .unwrap();
+        assert!(
+            vault
+                .read_note(Path::new(composed))
+                .unwrap()
+                .contains("appended-unicode-token")
+        );
+        let appended_results = vault.search_text("appended-unicode-token", 40).unwrap();
+        assert_eq!(appended_results.len(), 1);
+        assert_eq!(appended_results[0].path, disk_path);
+
+        let moved = vault
+            .move_note(Path::new(composed), Path::new("Moved/lic1c.md"))
+            .unwrap();
+        assert_eq!(moved, PathBuf::from("Moved/lic1c.md"));
+        assert!(vault.get_note_metadata(Path::new(composed)).is_err());
+        assert!(vault.get_note_metadata(&moved).is_ok());
+
+        vault.delete_note(&moved).unwrap();
+        assert!(vault.get_note_metadata(&moved).is_err());
+        assert!(
+            vault
+                .search_text("appended-unicode-token", 40)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
 // ── Periodic notes ───────────────────────────────────────────────────────
 
 mod vault_periodic {

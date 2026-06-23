@@ -70,7 +70,15 @@ pub async fn open_in_obsidian(
     vault: &Vault,
     params: OpenInObsidianParams,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    vault.validate_path(Path::new(&params.path))?;
+    let requested_path = Path::new(&params.path);
+    let uri_path = match vault.canonical_existing_relative_path(requested_path) {
+        Ok(path) => path.to_string_lossy().into_owned(),
+        Err(VaultError::NoteNotFound(_)) => {
+            vault.validate_path(requested_path)?;
+            params.path.clone()
+        }
+        Err(err) => return Err(err.into()),
+    };
 
     let vault_name = vault
         .root()
@@ -81,7 +89,7 @@ pub async fn open_in_obsidian(
     let mut uri = format!(
         "obsidian://open?vault={}&file={}",
         percent_encode(&vault_name),
-        percent_encode(&params.path),
+        percent_encode(&uri_path),
     );
 
     if params.new_leaf {
@@ -92,7 +100,7 @@ pub async fn open_in_obsidian(
 
     Ok(CallToolResult::success(vec![Content::text(format!(
         "Opened {} in Obsidian",
-        params.path
+        uri_path
     ))]))
 }
 

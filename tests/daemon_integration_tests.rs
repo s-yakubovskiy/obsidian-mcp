@@ -7,6 +7,7 @@ mod daemon_integration_tests {
     use std::time::{Duration, Instant};
 
     use serde_json::json;
+    use unicode_normalization::UnicodeNormalization;
 
     use crate::common::daemon_test_utils::{
         DaemonTestServer, create_temp_vault, rpc_request, write_note, write_note_bytes,
@@ -48,6 +49,27 @@ mod daemon_integration_tests {
 
         let hint = server.open_hint(vault.path(), "note.md#Heading").await;
         assert_eq!(hint.path, "note.md");
+        assert!(hint.exists);
+        assert_eq!(hint.subpath.as_deref(), Some("Heading"));
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn open_hint_accepts_canonically_equivalent_unicode_path() {
+        let _guard = MODEL_LOCK.lock().await;
+        let server = DaemonTestServer::start(MODEL_NAME).await;
+
+        let vault = create_temp_vault();
+        let composed = "02_База-знаний/Сущности/lic1c.md";
+        let decomposed: String = composed.nfd().collect();
+        write_note(vault.path(), &decomposed, "# License\nhello world");
+        server.ensure_vault(vault.path(), false).await;
+
+        let hint = server
+            .open_hint(vault.path(), &format!("{composed}#Heading"))
+            .await;
+        assert_eq!(hint.path, decomposed);
         assert!(hint.exists);
         assert_eq!(hint.subpath.as_deref(), Some("Heading"));
 

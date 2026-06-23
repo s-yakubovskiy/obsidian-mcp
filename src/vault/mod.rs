@@ -9,6 +9,7 @@ pub mod fs;
 pub mod index;
 pub mod parser;
 pub mod patch;
+pub mod path;
 pub mod periodic;
 pub mod search_utils;
 pub mod tantivy_index;
@@ -313,14 +314,14 @@ impl Vault {
     }
 
     pub fn write_note(&self, path: &Path, content: &str) -> VaultResult<()> {
-        fs::write_file(&self.inner.root, path, content)?;
-        self.reindex(path)?;
+        let actual_path = fs::write_file(&self.inner.root, path, content)?;
+        self.reindex(&actual_path)?;
         Ok(())
     }
 
     pub fn append_note(&self, path: &Path, content: &str) -> VaultResult<()> {
-        fs::append_file(&self.inner.root, path, content)?;
-        self.reindex(path)?;
+        let actual_path = fs::append_file(&self.inner.root, path, content)?;
+        self.reindex(&actual_path)?;
         Ok(())
     }
 
@@ -336,8 +337,8 @@ impl Vault {
             return Err(VaultError::AlreadyExists(path.to_path_buf()));
         }
         let full_content = frontmatter::rebuild_content(frontmatter, content);
-        fs::write_file(&self.inner.root, path, &full_content)?;
-        self.reindex(path)?;
+        let actual_path = fs::write_file(&self.inner.root, path, &full_content)?;
+        self.reindex(&actual_path)?;
         Ok(())
     }
 
@@ -354,50 +355,52 @@ impl Vault {
             }
             None => format!("{content}{existing}"),
         };
-        fs::write_file(&self.inner.root, path, &new_content)?;
-        self.reindex(path)?;
+        let actual_path = fs::write_file(&self.inner.root, path, &new_content)?;
+        self.reindex(&actual_path)?;
         Ok(())
     }
 
     pub fn delete_note(&self, path: &Path) -> VaultResult<()> {
-        fs::delete_file(&self.inner.root, path)?;
-        self.write_index().remove_file(path);
+        let actual_path = fs::delete_file(&self.inner.root, path)?;
+        self.write_index().remove_file(&actual_path);
         if let Some(tv) = &self.inner.tantivy {
-            tv.remove_file(path)?;
+            tv.remove_file(&actual_path)?;
         }
         #[cfg(has_embeddings)]
         {
-            self.next_embedding_generation(path);
-            self.remove_embedding(path);
-            self.clear_embedding_generation(path);
+            self.next_embedding_generation(&actual_path);
+            self.remove_embedding(&actual_path);
+            self.clear_embedding_generation(&actual_path);
         }
         Ok(())
     }
 
     pub fn move_note(&self, from: &Path, to: &Path) -> VaultResult<PathBuf> {
-        let new_path = fs::move_file(&self.inner.root, from, to)?;
+        let move_result = fs::move_file(&self.inner.root, from, to)?;
+        let old_path = move_result.from;
+        let new_path = move_result.to;
 
         if self.inner.exclude.is_excluded(&new_path) {
             {
                 let mut idx = self.write_index();
-                idx.remove_file(from);
+                idx.remove_file(&old_path);
                 idx.add_excluded_file(&new_path);
                 if let Some(tv) = &self.inner.tantivy {
-                    tv.remove_file(from)?;
+                    tv.remove_file(&old_path)?;
                 }
             }
             #[cfg(has_embeddings)]
             {
-                self.next_embedding_generation(from);
-                self.remove_embedding(from);
-                self.clear_embedding_generation(from);
+                self.next_embedding_generation(&old_path);
+                self.remove_embedding(&old_path);
+                self.clear_embedding_generation(&old_path);
             }
         } else {
             {
                 let mut idx = self.write_index();
-                idx.rename_file(&self.inner.root, from, &new_path)?;
+                idx.rename_file(&self.inner.root, &old_path, &new_path)?;
                 if let Some(tv) = &self.inner.tantivy {
-                    tv.remove_file(from)?;
+                    tv.remove_file(&old_path)?;
                     if let Some(meta) = idx.get_note(&new_path) {
                         tv.reindex_file(&self.inner.root, &new_path, meta)?;
                     }
@@ -405,9 +408,9 @@ impl Vault {
             }
             #[cfg(has_embeddings)]
             {
-                self.next_embedding_generation(from);
-                self.remove_embedding(from);
-                self.clear_embedding_generation(from);
+                self.next_embedding_generation(&old_path);
+                self.remove_embedding(&old_path);
+                self.clear_embedding_generation(&old_path);
                 self.reindex_embedding(&new_path);
             }
         }
@@ -420,8 +423,8 @@ impl Vault {
     pub fn patch_note(&self, path: &Path, request: &PatchRequest) -> VaultResult<()> {
         let content = fs::read_file(&self.inner.root, path)?;
         let patched = patch::apply_patch(&content, request, path)?;
-        fs::write_file(&self.inner.root, path, &patched)?;
-        self.reindex(path)?;
+        let actual_path = fs::write_file(&self.inner.root, path, &patched)?;
+        self.reindex(&actual_path)?;
         Ok(())
     }
 
@@ -440,26 +443,27 @@ impl Vault {
     ) -> VaultResult<()> {
         let content = fs::read_file(&self.inner.root, path)?;
         let updated = frontmatter::set_frontmatter_field(&content, key, value)?;
-        fs::write_file(&self.inner.root, path, &updated)?;
-        self.reindex(path)?;
+        let actual_path = fs::write_file(&self.inner.root, path, &updated)?;
+        self.reindex(&actual_path)?;
         Ok(())
     }
 
     pub fn remove_frontmatter_field(&self, path: &Path, key: &str) -> VaultResult<()> {
         let content = fs::read_file(&self.inner.root, path)?;
         let updated = frontmatter::remove_frontmatter_field(&content, key)?;
-        fs::write_file(&self.inner.root, path, &updated)?;
-        self.reindex(path)?;
+        let actual_path = fs::write_file(&self.inner.root, path, &updated)?;
+        self.reindex(&actual_path)?;
         Ok(())
     }
 
     // ── index delegation (read-lock) ───────────────────────────────────
 
     pub fn get_note_metadata(&self, path: &Path) -> VaultResult<NoteMetadata> {
+        let actual_path = self.canonical_existing_relative_path(path)?;
         self.read_index()
-            .get_note(path)
+            .get_note(&actual_path)
             .cloned()
-            .ok_or_else(|| VaultError::NoteNotFound(path.to_path_buf()))
+            .ok_or(VaultError::NoteNotFound(actual_path))
     }
 
     pub fn get_document_map(&self, path: &Path) -> VaultResult<DocumentMap> {
@@ -657,18 +661,20 @@ impl Vault {
     }
 
     pub fn backlinks(&self, path: &Path) -> VaultResult<Vec<NoteMetadata>> {
+        let actual_path = self.canonical_existing_relative_path(path)?;
         Ok(self
             .read_index()
-            .backlinks_to(path)
+            .backlinks_to(&actual_path)
             .into_iter()
             .cloned()
             .collect())
     }
 
     pub fn outgoing_links(&self, path: &Path) -> VaultResult<Vec<WikiLink>> {
+        let actual_path = self.canonical_existing_relative_path(path)?;
         Ok(self
             .read_index()
-            .outgoing_links(path)
+            .outgoing_links(&actual_path)
             .into_iter()
             .cloned()
             .collect())
@@ -693,6 +699,10 @@ impl Vault {
 
     pub fn vault_stats(&self) -> VaultResult<VaultStats> {
         Ok(self.read_index().stats().clone())
+    }
+
+    pub(crate) fn canonical_existing_relative_path(&self, path: &Path) -> VaultResult<PathBuf> {
+        Ok(path::resolve_existing(&self.inner.root, path)?.relative)
     }
 
     /// Validate that a relative path doesn't escape the vault root.
@@ -748,9 +758,9 @@ impl Vault {
             }
         };
 
-        fs::write_file(&self.inner.root, &path, &content)?;
-        self.reindex(&path)?;
-        Ok(path)
+        let actual_path = fs::write_file(&self.inner.root, &path, &content)?;
+        self.reindex(&actual_path)?;
+        Ok(actual_path)
     }
 
     pub fn list_recent_periodic_notes(
@@ -827,30 +837,31 @@ impl Vault {
     }
 
     fn reindex(&self, path: &Path) -> VaultResult<()> {
-        if self.inner.exclude.is_excluded(path) {
-            self.write_index().add_excluded_file(path);
+        let actual_path = self.canonical_existing_relative_path(path)?;
+        if self.inner.exclude.is_excluded(&actual_path) {
+            self.write_index().add_excluded_file(&actual_path);
             if let Some(tv) = &self.inner.tantivy {
-                tv.remove_file(path)?;
+                tv.remove_file(&actual_path)?;
             }
             #[cfg(has_embeddings)]
             {
-                self.next_embedding_generation(path);
-                self.remove_embedding(path);
-                self.clear_embedding_generation(path);
+                self.next_embedding_generation(&actual_path);
+                self.remove_embedding(&actual_path);
+                self.clear_embedding_generation(&actual_path);
             }
             return Ok(());
         }
 
         let mut idx = self.write_index();
-        idx.reindex_file(&self.inner.root, path)?;
+        idx.reindex_file(&self.inner.root, &actual_path)?;
         if let Some(tv) = &self.inner.tantivy
-            && let Some(meta) = idx.get_note(path)
+            && let Some(meta) = idx.get_note(&actual_path)
         {
-            tv.reindex_file(&self.inner.root, path, meta)?;
+            tv.reindex_file(&self.inner.root, &actual_path, meta)?;
         }
         drop(idx);
         #[cfg(has_embeddings)]
-        self.reindex_embedding(path);
+        self.reindex_embedding(&actual_path);
         Ok(())
     }
 
@@ -1019,6 +1030,7 @@ mod tests {
     use super::*;
     use crate::models::{PatchOperation, PatchTargetType};
     use crate::test_helpers::{create_test_vault, tantivy_config, test_config};
+    use unicode_normalization::UnicodeNormalization;
 
     #[tokio::test]
     async fn vault_open_succeeds() {
@@ -1125,6 +1137,59 @@ mod tests {
 
         let content = vault.read_note(Path::new("subdir/new.md")).unwrap();
         assert_eq!(content, "# Moved");
+    }
+
+    #[tokio::test]
+    async fn vault_metadata_accepts_canonically_equivalent_unicode_path() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let composed = "02_База-знаний/Сущности/lic1c.md";
+        let decomposed: String = composed.nfd().collect();
+        let disk_path = PathBuf::from(&decomposed);
+        std::fs::create_dir_all(dir.path().join(disk_path.parent().unwrap())).unwrap();
+        std::fs::write(dir.path().join(&disk_path), "# License\n").unwrap();
+
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+        let meta = vault.get_note_metadata(Path::new(composed)).unwrap();
+
+        assert_eq!(meta.path, disk_path);
+    }
+
+    #[tokio::test]
+    async fn vault_write_delete_and_move_use_unicode_canonical_index_key() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let composed = "02_База-знаний/Сущности/lic1c.md";
+        let decomposed: String = composed.nfd().collect();
+        let disk_path = PathBuf::from(&decomposed);
+        std::fs::create_dir_all(dir.path().join(disk_path.parent().unwrap())).unwrap();
+        std::fs::write(dir.path().join(&disk_path), "# Old\n").unwrap();
+
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+        let before = vault.vault_stats().unwrap().total_notes;
+
+        vault
+            .write_note(Path::new(composed), "# New\nunique-unicode-write\n")
+            .unwrap();
+        assert_eq!(vault.vault_stats().unwrap().total_notes, before);
+        assert_eq!(
+            vault
+                .search_text("unique-unicode-write", 40)
+                .unwrap()
+                .first()
+                .map(|result| result.path.clone()),
+            Some(disk_path.clone())
+        );
+
+        let moved = vault
+            .move_note(Path::new(composed), Path::new("Moved/lic1c.md"))
+            .unwrap();
+        assert_eq!(moved, PathBuf::from("Moved/lic1c.md"));
+        assert!(vault.get_note_metadata(Path::new(composed)).is_err());
+        assert!(vault.get_note_metadata(&moved).is_ok());
+
+        vault.delete_note(&moved).unwrap();
+        assert!(vault.get_note_metadata(&moved).is_err());
     }
 
     #[tokio::test]

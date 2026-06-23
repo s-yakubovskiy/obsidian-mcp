@@ -2,38 +2,19 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use globset::Glob;
 use walkdir::WalkDir;
 
 use crate::error::{VaultError, VaultResult};
 use crate::models::FileStat;
+use crate::vault::path as vault_path;
 
-/// Normalize a relative path, rejecting any component that would escape the root.
-///
-/// Strips `.` components, resolves `..` by popping, and rejects absolute paths
-/// or `..` that would go above the root.
-fn normalize_relative(path: &Path) -> VaultResult<PathBuf> {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(c) => normalized.push(c),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    return Err(VaultError::OutsideVault(path.to_path_buf()));
-                }
-            }
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(VaultError::InvalidPath(format!(
-                    "absolute paths not allowed: {}",
-                    path.display()
-                )));
-            }
-        }
-    }
-    Ok(normalized)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoveResult {
+    pub from: PathBuf,
+    pub to: PathBuf,
 }
 
 fn is_hidden(name: &str) -> bool {
@@ -52,33 +33,19 @@ fn map_not_found(path: &Path) -> impl FnOnce(std::io::Error) -> VaultError + '_ 
 /// For existing paths, canonicalization catches symlink escapes.
 /// For non-existent paths, manual normalization is sufficient.
 pub fn resolve_path(vault_root: &Path, relative: &Path) -> VaultResult<PathBuf> {
-    let normalized = normalize_relative(relative)?;
-    let absolute = vault_root.join(&normalized);
-
-    if absolute.exists() {
-        let canonical_root = vault_root
-            .canonicalize()
-            .map_err(|_| VaultError::InvalidPath(vault_root.display().to_string()))?;
-        let canonical = absolute.canonicalize()?;
-        if !canonical.starts_with(&canonical_root) {
-            return Err(VaultError::OutsideVault(relative.to_path_buf()));
-        }
-        Ok(canonical)
-    } else {
-        Ok(absolute)
-    }
+    Ok(vault_path::resolve_for_write(vault_root, relative)?.absolute)
 }
 
 /// Check if path exists and is a file.
 pub fn file_exists(vault_root: &Path, path: &Path) -> bool {
-    resolve_path(vault_root, path)
-        .map(|p| p.is_file())
+    vault_path::resolve_existing(vault_root, path)
+        .map(|p| p.absolute.is_file())
         .unwrap_or(false)
 }
 
 /// Get file stat (size, created, modified).
 pub fn file_stat(vault_root: &Path, path: &Path) -> VaultResult<FileStat> {
-    let abs = resolve_path(vault_root, path)?;
+    let abs = vault_path::resolve_existing(vault_root, path)?.absolute;
     let meta = fs::metadata(&abs).map_err(map_not_found(path))?;
 
     let created = meta
@@ -99,60 +66,62 @@ pub fn file_stat(vault_root: &Path, path: &Path) -> VaultResult<FileStat> {
 
 /// Read a file's content as a UTF-8 string.
 pub fn read_file(vault_root: &Path, path: &Path) -> VaultResult<String> {
-    let abs = resolve_path(vault_root, path)?;
+    let abs = vault_path::resolve_existing(vault_root, path)?.absolute;
     fs::read_to_string(&abs).map_err(map_not_found(path))
 }
 
 /// Write content to a file (creates parent dirs if needed). Overwrites if exists.
-pub fn write_file(vault_root: &Path, path: &Path, content: &str) -> VaultResult<()> {
-    let abs = resolve_path(vault_root, path)?;
-    if let Some(parent) = abs.parent() {
+pub fn write_file(vault_root: &Path, path: &Path, content: &str) -> VaultResult<PathBuf> {
+    let resolved = vault_path::resolve_for_write(vault_root, path)?;
+    if let Some(parent) = resolved.absolute.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&abs, content)?;
-    Ok(())
+    fs::write(&resolved.absolute, content)?;
+    Ok(resolved.relative)
 }
 
 /// Append content to a file. Creates the file if it doesn't exist.
-pub fn append_file(vault_root: &Path, path: &Path, content: &str) -> VaultResult<()> {
-    let abs = resolve_path(vault_root, path)?;
-    if let Some(parent) = abs.parent() {
+pub fn append_file(vault_root: &Path, path: &Path, content: &str) -> VaultResult<PathBuf> {
+    let resolved = vault_path::resolve_for_write(vault_root, path)?;
+    if let Some(parent) = resolved.absolute.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut file = OpenOptions::new().create(true).append(true).open(&abs)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&resolved.absolute)?;
     file.write_all(content.as_bytes())?;
-    Ok(())
+    Ok(resolved.relative)
 }
 
 /// Delete a file or empty directory.
-pub fn delete_file(vault_root: &Path, path: &Path) -> VaultResult<()> {
-    let abs = resolve_path(vault_root, path)?;
-    if abs.is_dir() {
-        fs::remove_dir(&abs).map_err(map_not_found(path))
+pub fn delete_file(vault_root: &Path, path: &Path) -> VaultResult<PathBuf> {
+    let resolved = vault_path::resolve_existing(vault_root, path)?;
+    if resolved.absolute.is_dir() {
+        fs::remove_dir(&resolved.absolute).map_err(map_not_found(path))?;
     } else {
-        fs::remove_file(&abs).map_err(map_not_found(path))
+        fs::remove_file(&resolved.absolute).map_err(map_not_found(path))?;
     }
+    Ok(resolved.relative)
 }
 
-/// Move/rename a file. Returns the new relative path.
-pub fn move_file(vault_root: &Path, from: &Path, to: &Path) -> VaultResult<PathBuf> {
-    let abs_from = resolve_path(vault_root, from)?;
-    if !abs_from.exists() {
-        return Err(VaultError::NoteNotFound(from.to_path_buf()));
-    }
-
-    let abs_to = resolve_path(vault_root, to)?;
-    if abs_to.exists() {
+/// Move/rename a file. Returns the actual source and destination relative paths.
+pub fn move_file(vault_root: &Path, from: &Path, to: &Path) -> VaultResult<MoveResult> {
+    let resolved_from = vault_path::resolve_existing(vault_root, from)?;
+    let resolved_to = vault_path::resolve_for_write(vault_root, to)?;
+    if resolved_to.absolute.exists() {
         return Err(VaultError::AlreadyExists(to.to_path_buf()));
     }
 
-    if let Some(parent) = abs_to.parent() {
+    if let Some(parent) = resolved_to.absolute.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::rename(&abs_from, &abs_to)?;
+    fs::rename(&resolved_from.absolute, &resolved_to.absolute)?;
 
-    let normalized_to = normalize_relative(to)?;
-    Ok(normalized_to)
+    Ok(MoveResult {
+        from: resolved_from.relative,
+        to: resolved_to.relative,
+    })
 }
 
 /// List files/dirs in a directory. Returns paths relative to vault root.
@@ -166,7 +135,12 @@ pub fn list_files(
     recursive: bool,
     glob: Option<&str>,
 ) -> VaultResult<Vec<PathBuf>> {
-    let abs_dir = resolve_path(vault_root, dir)?;
+    let abs_dir = vault_path::resolve_existing(vault_root, dir)
+        .map_err(|err| match err {
+            VaultError::NoteNotFound(_) => VaultError::DirectoryNotFound(dir.to_path_buf()),
+            other => other,
+        })?
+        .absolute;
     if !abs_dir.is_dir() {
         return Err(VaultError::DirectoryNotFound(dir.to_path_buf()));
     }
@@ -186,15 +160,13 @@ pub fn list_files(
     let mut results = Vec::new();
 
     let mut try_add = |entry_path: &Path| -> VaultResult<()> {
-        if let Ok(rel) = entry_path.strip_prefix(&canonical_root) {
-            let rel = rel.to_path_buf();
-            if let Some(ref matcher) = glob_matcher
-                && !matcher.is_match(&rel)
-            {
-                return Ok(());
-            }
-            results.push(rel);
+        let rel = vault_path::relative_from_absolute(&canonical_root, entry_path)?;
+        if let Some(ref matcher) = glob_matcher
+            && !matcher.is_match(&rel)
+        {
+            return Ok(());
         }
+        results.push(rel);
         Ok(())
     };
 
@@ -231,6 +203,7 @@ pub fn list_files(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use unicode_normalization::UnicodeNormalization;
 
     fn setup_vault() -> TempDir {
         let dir = TempDir::new().unwrap();
@@ -377,6 +350,35 @@ mod tests {
         assert_eq!(read_file(vault.path(), path).unwrap(), "overwritten");
     }
 
+    #[test]
+    fn write_returns_existing_unicode_normalized_relative_path() {
+        let vault = setup_vault();
+        let composed = "02_База-знаний/lic1c.md";
+        let decomposed: String = composed.nfd().collect();
+        let disk_path = PathBuf::from(&decomposed);
+        fs::create_dir_all(vault.path().join(disk_path.parent().unwrap())).unwrap();
+        fs::write(vault.path().join(&disk_path), "old").unwrap();
+
+        let written = write_file(vault.path(), Path::new(composed), "new").unwrap();
+
+        assert_eq!(written, disk_path);
+        assert_eq!(read_file(vault.path(), Path::new(composed)).unwrap(), "new");
+    }
+
+    #[test]
+    fn write_uses_existing_unicode_normalized_parent() {
+        let vault = setup_vault();
+        let composed_dir = "02_База-знаний";
+        let decomposed_dir: String = composed_dir.nfd().collect();
+        fs::create_dir_all(vault.path().join(&decomposed_dir)).unwrap();
+
+        let written =
+            write_file(vault.path(), Path::new("02_База-знаний/New.md"), "content").unwrap();
+
+        assert_eq!(written, PathBuf::from(format!("{decomposed_dir}/New.md")));
+        assert!(vault.path().join(written).is_file());
+    }
+
     // ── append_file ──
 
     #[test]
@@ -433,10 +435,32 @@ mod tests {
         let from = Path::new("note1.md");
         let to = Path::new("renamed.md");
         let result = move_file(vault.path(), from, to).unwrap();
-        assert_eq!(result, PathBuf::from("renamed.md"));
+        assert_eq!(result.from, PathBuf::from("note1.md"));
+        assert_eq!(result.to, PathBuf::from("renamed.md"));
         assert!(!file_exists(vault.path(), from));
         assert!(file_exists(vault.path(), to));
         assert_eq!(read_file(vault.path(), to).unwrap(), "# Note 1\nHello");
+    }
+
+    #[test]
+    fn move_returns_existing_unicode_normalized_source() {
+        let vault = setup_vault();
+        let composed = "02_База-знаний/lic1c.md";
+        let decomposed: String = composed.nfd().collect();
+        let disk_path = PathBuf::from(&decomposed);
+        fs::create_dir_all(vault.path().join(disk_path.parent().unwrap())).unwrap();
+        fs::write(vault.path().join(&disk_path), "# License").unwrap();
+
+        let moved = move_file(
+            vault.path(),
+            Path::new(composed),
+            Path::new("Moved/lic1c.md"),
+        )
+        .unwrap();
+
+        assert_eq!(moved.from, disk_path);
+        assert_eq!(moved.to, PathBuf::from("Moved/lic1c.md"));
+        assert!(file_exists(vault.path(), Path::new("Moved/lic1c.md")));
     }
 
     #[test]

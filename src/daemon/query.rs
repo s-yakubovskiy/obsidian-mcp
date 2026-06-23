@@ -139,13 +139,21 @@ pub async fn open_hint(
         ));
     }
 
-    let exists = match context.read_note(relative) {
-        Ok(_) => true,
-        Err(VaultError::NoteNotFound(_)) => false,
+    let canonical_path = match context.canonical_existing_relative_path(relative) {
+        Ok(path) => match context.read_note(&path) {
+            Ok(_) => Some(path),
+            Err(err) => return Err(map_vault_error(err)),
+        },
+        Err(VaultError::NoteNotFound(_)) => None,
         Err(err) => return Err(map_vault_error(err)),
     };
+    let exists = canonical_path.is_some();
+    let path = match canonical_path {
+        Some(path) => path.to_string_lossy().into_owned(),
+        None => path_part.to_string(),
+    };
     Ok(OpenHintResult {
-        path: path_part.to_string(),
+        path,
         exists,
         subpath,
     })

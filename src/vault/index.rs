@@ -10,7 +10,7 @@ use walkdir::WalkDir;
 use crate::error::{VaultError, VaultResult};
 use crate::models::{NoteMetadata, SearchMatch, SearchResult, VaultStats, WikiLink};
 use crate::vault::wikilink::{LinkResolver, build_link_resolver};
-use crate::vault::{frontmatter, fs, parser};
+use crate::vault::{frontmatter, fs, parser, path as vault_path};
 
 use super::exclude::ExcludeSet;
 
@@ -82,14 +82,7 @@ impl VaultIndex {
             }
 
             let abs_path = entry.path();
-            let rel = abs_path.strip_prefix(vault_root).map_err(|_| {
-                VaultError::Other(format!(
-                    "path {} is not under vault root {}",
-                    abs_path.display(),
-                    vault_root.display()
-                ))
-            })?;
-            let rel_path = PathBuf::from(rel.to_string_lossy().replace('\\', "/"));
+            let rel_path = vault_path::relative_from_absolute(vault_root, abs_path)?;
 
             let is_md = abs_path
                 .extension()
@@ -656,6 +649,7 @@ mod tests {
     use std::fs as stdfs;
     use std::sync::Arc;
     use tempfile::TempDir;
+    use unicode_normalization::UnicodeNormalization;
 
     fn empty_exclude() -> Arc<ExcludeSet> {
         Arc::new(ExcludeSet::build(vec![]).unwrap())
@@ -722,6 +716,23 @@ mod tests {
         assert!(index.get_note(Path::new("notes/beta.md")).is_some());
         assert!(index.get_note(Path::new("notes/gamma.md")).is_some());
         assert!(index.get_note(Path::new("archive/old.md")).is_some());
+    }
+
+    #[tokio::test]
+    async fn build_keeps_actual_unicode_relative_path() {
+        let vault = tempfile::tempdir().unwrap();
+        let composed = "02_База-знаний/Сущности/lic1c.md";
+        let decomposed: String = composed.nfd().collect();
+        let disk_path = PathBuf::from(&decomposed);
+        stdfs::create_dir_all(vault.path().join(disk_path.parent().unwrap())).unwrap();
+        stdfs::write(vault.path().join(&disk_path), "# License\n").unwrap();
+
+        let index = VaultIndex::build(vault.path(), empty_exclude())
+            .await
+            .unwrap();
+
+        assert!(index.get_note(&disk_path).is_some());
+        assert!(index.get_note(Path::new(composed)).is_none());
     }
 
     #[tokio::test]

@@ -145,9 +145,10 @@ async fn wikilinks_backlinks(
     note_path: &str,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     let path = Path::new(note_path);
-    vault.get_note_metadata(path)?;
+    let target_path = vault.canonical_existing_relative_path(path)?;
+    vault.get_note_metadata(&target_path)?;
 
-    let backlink_notes = vault.backlinks(path)?;
+    let backlink_notes = vault.backlinks(&target_path)?;
 
     let result: Vec<BacklinkSource> = backlink_notes
         .iter()
@@ -155,7 +156,7 @@ async fn wikilinks_backlinks(
             let matching: Vec<BacklinkRef> = source
                 .links
                 .iter()
-                .filter(|link| vault.resolve_link(&link.target).as_deref() == Some(path))
+                .filter(|link| vault.resolve_link(&link.target).as_deref() == Some(&target_path))
                 .map(|link| BacklinkRef {
                     raw: link.raw.clone(),
                     line: link.line,
@@ -181,9 +182,10 @@ async fn wikilinks_outgoing(
     note_path: &str,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     let path = Path::new(note_path);
-    vault.get_note_metadata(path)?;
+    let actual_path = vault.canonical_existing_relative_path(path)?;
+    vault.get_note_metadata(&actual_path)?;
 
-    let links = vault.outgoing_links(path)?;
+    let links = vault.outgoing_links(&actual_path)?;
 
     let result: Vec<OutgoingLink> = links
         .into_iter()
@@ -210,14 +212,15 @@ async fn wikilinks_broken(
     let result: Vec<BrokenLink> = match note_path {
         Some(p) => {
             let path = Path::new(p);
-            vault.get_note_metadata(path)?;
-            let links = vault.outgoing_links(path)?;
+            let actual_path = vault.canonical_existing_relative_path(path)?;
+            vault.get_note_metadata(&actual_path)?;
+            let links = vault.outgoing_links(&actual_path)?;
 
             links
                 .into_iter()
                 .filter(|link| is_broken_target(vault, &link.target))
                 .map(|link| BrokenLink {
-                    source_path: path.to_path_buf(),
+                    source_path: actual_path.clone(),
                     link_raw: link.raw,
                     target: link.target,
                 })
@@ -297,6 +300,7 @@ mod tests {
     use super::*;
 
     use crate::test_helpers::{extract_text, test_config};
+    use unicode_normalization::UnicodeNormalization;
 
     fn create_test_vault(dir: &Path) {
         crate::test_helpers::create_test_vault(dir);
@@ -373,6 +377,33 @@ mod tests {
         let b_links = b_entry["links"].as_array().unwrap();
         assert_eq!(b_links.len(), 1);
         assert!(b_links[0]["raw"].as_str().unwrap().contains("[[a]]"));
+    }
+
+    #[tokio::test]
+    async fn backlinks_accept_canonically_equivalent_unicode_path() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let composed = "02_База-знаний/Сущности/lic1c.md";
+        let decomposed: String = composed.nfd().collect();
+        let disk_path = PathBuf::from(&decomposed);
+        std::fs::create_dir_all(dir.path().join(disk_path.parent().unwrap())).unwrap();
+        std::fs::write(dir.path().join(&disk_path), "# License\n").unwrap();
+        std::fs::write(
+            dir.path().join("source.md"),
+            "# Source\n\nLinks to [[02_База-знаний/Сущности/lic1c]].\n",
+        )
+        .unwrap();
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+
+        let result = wikilinks(&vault, backlinks_params(composed)).await.unwrap();
+        let text = extract_text(&result);
+        let backlinks: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
+
+        assert!(
+            backlinks
+                .iter()
+                .any(|entry| entry["source_path"] == "source.md")
+        );
     }
 
     #[tokio::test]

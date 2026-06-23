@@ -11,6 +11,7 @@ use tokio::runtime::Handle;
 use crate::error::{VaultError, VaultResult};
 use crate::vault::exclude::ExcludeSet;
 use crate::vault::index::VaultIndex;
+use crate::vault::path as vault_path;
 use crate::vault::tantivy_index::TantivyIndex;
 
 #[cfg(has_embeddings)]
@@ -162,17 +163,16 @@ pub fn start_watcher(
 }
 
 fn should_process_path(vault_root: &Path, absolute: &Path, exclude: &ExcludeSet) -> bool {
-    let relative = match absolute.strip_prefix(vault_root) {
+    let relative = match vault_path::relative_from_absolute(vault_root, absolute) {
         Ok(relative) => relative,
         Err(_) => return false,
     };
 
-    if is_obsidian_dir(relative) {
+    if is_obsidian_dir(&relative) {
         return false;
     }
 
-    let rel_str = relative.to_string_lossy().replace('\\', "/");
-    if exclude.is_excluded(Path::new(&rel_str)) {
+    if exclude.is_excluded(&relative) {
         return false;
     }
 
@@ -208,8 +208,8 @@ fn process_event(
         return (false, false);
     }
 
-    let relative = match absolute.strip_prefix(vault_root) {
-        Ok(relative) => relative.to_path_buf(),
+    let relative = match vault_path::relative_from_absolute(vault_root, absolute) {
+        Ok(relative) => relative,
         Err(_) => return (false, false),
     };
 
@@ -282,8 +282,8 @@ fn process_event(
         return false;
     }
 
-    let relative = match absolute.strip_prefix(vault_root) {
-        Ok(relative) => relative.to_path_buf(),
+    let relative = match vault_path::relative_from_absolute(vault_root, absolute) {
+        Ok(relative) => relative,
         Err(_) => return false,
     };
 
@@ -332,5 +332,43 @@ fn process_event(
             return true;
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use unicode_normalization::UnicodeNormalization;
+
+    #[test]
+    fn should_process_unicode_markdown_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let composed = "02_База-знаний/Сущности/lic1c.md";
+        let decomposed: String = composed.nfd().collect();
+        let absolute = dir.path().join(decomposed);
+        let exclude = ExcludeSet::build(vec![]).unwrap();
+
+        assert!(should_process_path(dir.path(), &absolute, &exclude));
+    }
+
+    #[cfg(not(has_embeddings))]
+    #[test]
+    fn process_event_indexes_actual_unicode_relative_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let composed = "02_База-знаний/Сущности/lic1c.md";
+        let decomposed: String = composed.nfd().collect();
+        let disk_path = PathBuf::from(&decomposed);
+        let absolute = dir.path().join(&disk_path);
+        std::fs::create_dir_all(absolute.parent().unwrap()).unwrap();
+        std::fs::write(&absolute, "# License\n").unwrap();
+
+        let index = Arc::new(RwLock::new(VaultIndex::empty()));
+        let exclude = ExcludeSet::build(vec![]).unwrap();
+
+        let _ = process_event(dir.path(), &index, None, &absolute, &exclude);
+
+        let index = index.read().unwrap();
+        assert!(index.get_note(&disk_path).is_some());
+        assert!(index.get_note(Path::new(composed)).is_none());
     }
 }

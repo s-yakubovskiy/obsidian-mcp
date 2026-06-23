@@ -1,7 +1,7 @@
 //! Vault listing and navigation tools (`vault_list`).
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rmcp::model::{CallToolResult, Content, ErrorCode};
 use schemars::JsonSchema;
@@ -78,10 +78,15 @@ fn vault_list_tree(
     let dir = params.path.as_deref().unwrap_or("");
     let dir_path = Path::new(dir);
     let files = vault.list_files(dir_path, true, None)?;
+    let canonical_dir = if dir.is_empty() {
+        PathBuf::new()
+    } else {
+        vault.canonical_existing_relative_path(dir_path)?
+    };
 
     let mut root = TreeNode::new();
     for path in &files {
-        let relative = path.strip_prefix(dir_path).unwrap_or(path);
+        let relative = path.strip_prefix(&canonical_dir).unwrap_or(path);
         if let Some(max) = params.max_depth
             && relative.components().count() > max
         {
@@ -90,8 +95,12 @@ fn vault_list_tree(
         root.insert(relative);
     }
 
-    let label = if dir.is_empty() { "." } else { dir };
-    let mut output = label.to_string();
+    let label = if canonical_dir.as_os_str().is_empty() {
+        ".".to_string()
+    } else {
+        canonical_dir.to_string_lossy().into_owned()
+    };
+    let mut output = label;
     output.push('\n');
     render_tree(&root, &mut output, "");
 
@@ -150,6 +159,7 @@ mod tests {
 
     use super::*;
     use crate::test_helpers::{extract_text, test_config};
+    use unicode_normalization::UnicodeNormalization;
 
     fn create_test_vault(dir: &Path) {
         crate::test_helpers::create_test_vault(dir);
@@ -333,6 +343,32 @@ mod tests {
         assert!(text.contains("alpha"));
         assert!(text.contains("spec.md"));
         assert!(!text.contains("journal"));
+    }
+
+    #[tokio::test]
+    async fn list_tree_subdirectory_strips_canonical_unicode_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let composed = "02_База-знаний";
+        let decomposed: String = composed.nfd().collect();
+        fs::create_dir_all(dir.path().join(&decomposed)).unwrap();
+        fs::write(dir.path().join(&decomposed).join("lic1c.md"), "# License").unwrap();
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+
+        let result = vault_list(
+            &vault,
+            VaultListParams {
+                format: Some("tree".into()),
+                path: Some(composed.to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let text = extract_text(&result);
+
+        assert!(text.starts_with(&decomposed));
+        assert!(text.contains("lic1c.md"));
+        assert!(!text.contains(&format!("{decomposed}/lic1c.md")));
     }
 
     #[tokio::test]

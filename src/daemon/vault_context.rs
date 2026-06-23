@@ -144,15 +144,24 @@ impl VaultContext {
     }
 
     pub fn note_metadata(&self, path: &Path) -> VaultResult<Option<NoteMetadata>> {
+        let actual_path = match self.canonical_existing_relative_path(path) {
+            Ok(path) => path,
+            Err(VaultError::NoteNotFound(_)) => return Ok(None),
+            Err(err) => return Err(err),
+        };
         let guard = self
             .index
             .read()
             .map_err(|err| VaultError::Other(format!("daemon index lock poisoned: {err}")))?;
-        Ok(guard.get_note(path).cloned())
+        Ok(guard.get_note(&actual_path).cloned())
     }
 
     pub fn read_note(&self, path: &Path) -> VaultResult<String> {
         crate::vault::fs::read_file(&self.vault_root, path)
+    }
+
+    pub fn canonical_existing_relative_path(&self, path: &Path) -> VaultResult<PathBuf> {
+        Ok(crate::vault::path::resolve_existing(&self.vault_root, path)?.relative)
     }
 
     pub fn search_bm25(&self, query: &str, top_k: usize) -> VaultResult<Vec<(PathBuf, f32)>> {

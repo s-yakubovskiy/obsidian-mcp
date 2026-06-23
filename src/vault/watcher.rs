@@ -17,6 +17,7 @@ use tokio::runtime::Handle;
 
 use super::exclude::ExcludeSet;
 use super::index::VaultIndex;
+use super::path as vault_path;
 use super::tantivy_index::TantivyIndex;
 use crate::error::{VaultError, VaultResult};
 
@@ -173,7 +174,7 @@ pub fn start_watcher(
 /// - Paths inside `.obsidian/` or `.obsidian-mcp/`
 /// - Non-`.md` files
 fn should_process_path(vault_root: &Path, absolute: &Path) -> bool {
-    let relative = match absolute.strip_prefix(vault_root) {
+    let relative = match vault_path::relative_from_absolute(vault_root, absolute) {
         Ok(r) => r,
         Err(_) => {
             tracing::trace!(path = %absolute.display(), "event path outside vault root, ignoring");
@@ -181,7 +182,7 @@ fn should_process_path(vault_root: &Path, absolute: &Path) -> bool {
         }
     };
 
-    if is_obsidian_dir(relative) {
+    if is_obsidian_dir(&relative) {
         return false;
     }
 
@@ -219,10 +220,7 @@ fn is_obsidian_dir(relative: &Path) -> bool {
 }
 
 fn normalized_relative_path(vault_root: &Path, absolute: &Path) -> Option<PathBuf> {
-    absolute
-        .strip_prefix(vault_root)
-        .ok()
-        .map(|relative| PathBuf::from(relative.to_string_lossy().replace('\\', "/")))
+    vault_path::relative_from_absolute(vault_root, absolute).ok()
 }
 
 fn is_excluded_path(exclude: &ExcludeSet, relative: &Path) -> bool {
@@ -481,6 +479,7 @@ fn process_event(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use unicode_normalization::UnicodeNormalization;
 
     fn vault() -> PathBuf {
         PathBuf::from("/tmp/test-vault")
@@ -595,6 +594,18 @@ mod tests {
             &exclude,
             Path::new("Daily/2024-01-01.md")
         ));
+    }
+
+    #[test]
+    fn normalized_relative_path_preserves_actual_unicode_event_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let composed = "02_База-знаний/Сущности/lic1c.md";
+        let decomposed: String = composed.nfd().collect();
+        let absolute = dir.path().join(&decomposed);
+
+        let relative = normalized_relative_path(dir.path(), &absolute).unwrap();
+
+        assert_eq!(relative, PathBuf::from(decomposed));
     }
 
     fn call_start_watcher(
