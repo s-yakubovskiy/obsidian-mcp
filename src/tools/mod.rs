@@ -127,7 +127,7 @@ impl ObsidianMcp {
 
     #[tool(
         name = "note_patch",
-        description = "Patch a specific section of a note by targeting a heading, block reference, or frontmatter field. Supports append, prepend, and replace operations."
+        description = "Patch a specific section of a note by targeting a heading, block reference, or frontmatter field. Supports append, prepend, and replace operations. Heading targets use bare text such as \"Log\"; ATX marker-prefixed targets such as \"## Log\" are also accepted."
     )]
     async fn note_patch(
         &self,
@@ -214,7 +214,7 @@ impl ObsidianMcp {
 
     #[tool(
         name = "note_inspect",
-        description = "Inspect a note. Views: \"metadata\" (default) returns tags, headings, outgoing links, block refs, backlinks count, frontmatter, and file stats. \"targets\" lists patchable headings, block refs, and frontmatter fields (use before note_patch)."
+        description = "Inspect a note. Views: \"metadata\" (default) returns tags, headings, outgoing links, block refs, backlinks count, frontmatter, and file stats. \"targets\" lists patchable headings with Markdown level markers, block refs, and frontmatter fields (use before note_patch)."
     )]
     async fn note_inspect(
         &self,

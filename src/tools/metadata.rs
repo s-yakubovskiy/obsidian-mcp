@@ -167,7 +167,9 @@ pub async fn frontmatter(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{PatchOperation, PatchTargetType};
     use crate::test_helpers::{create_test_vault, test_config};
+    use crate::tools::notes::{NotePatchParams, note_patch};
 
     #[tokio::test]
     async fn note_inspect_metadata_returns_all_fields() {
@@ -282,6 +284,58 @@ mod tests {
                 .unwrap()
                 .contains(&serde_json::json!("date"))
         );
+    }
+
+    #[tokio::test]
+    async fn note_inspect_targets_heading_can_be_used_for_note_patch() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+
+        vault
+            .write_note(
+                Path::new("scratch.md"),
+                "# Scratch\n\n## Log\n\n| Date | Update |\n| ---- | ------ |\n",
+            )
+            .unwrap();
+
+        let result = note_inspect(
+            &vault,
+            NoteInspectParams {
+                path: "scratch.md".into(),
+                view: Some("targets".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let v = result.structured_content.unwrap();
+        let headings = v["headings"].as_array().unwrap();
+        let target = headings
+            .iter()
+            .find_map(|h| {
+                let heading = h.as_str().unwrap();
+                (heading == "## Log").then(|| heading.to_string())
+            })
+            .expect("targets view should return marker-prefixed heading");
+
+        note_patch(
+            &vault,
+            NotePatchParams {
+                path: "scratch.md".into(),
+                operation: PatchOperation::Append,
+                target_type: PatchTargetType::Heading,
+                target,
+                content: "| 2026-02-02 | x |".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let content = vault.read_note(Path::new("scratch.md")).unwrap();
+        let log_idx = content.find("## Log").unwrap();
+        let appended_idx = content.find("| 2026-02-02 | x |").unwrap();
+        assert!(appended_idx > log_idx);
     }
 
     #[tokio::test]

@@ -110,6 +110,20 @@ fn parse_heading(line: &str) -> Option<(u8, &str)> {
     Some((level as u8, rest.trim()))
 }
 
+fn normalize_heading_target_segment(segment: &str) -> &str {
+    let trimmed = segment.trim();
+    let level = trimmed.bytes().take_while(|&b| b == b'#').count();
+
+    if (1..=6).contains(&level) {
+        let rest = &trimmed[level..];
+        if rest.chars().next().is_some_and(char::is_whitespace) {
+            return rest.trim();
+        }
+    }
+
+    trimmed
+}
+
 /// Collect all headings outside fenced code blocks and frontmatter.
 fn find_headings(content: &str) -> Vec<ParsedHeading<'_>> {
     let mut out = Vec::new();
@@ -149,11 +163,21 @@ fn resolve_heading_range(
     let mut heading_line: usize = 0;
 
     for segment in &segments {
-        let seg = segment.trim();
-        let found = headings.iter().find(|h| {
-            h.line_idx >= search_start
-                && h.line_idx < search_end
-                && h.text.eq_ignore_ascii_case(seg)
+        let raw_seg = segment.trim();
+        let normalized_seg = normalize_heading_target_segment(segment);
+        let find_match = |candidate: &str| {
+            headings.iter().find(|h| {
+                h.line_idx >= search_start
+                    && h.line_idx < search_end
+                    && h.text.eq_ignore_ascii_case(candidate)
+            })
+        };
+        let found = find_match(raw_seg).or_else(|| {
+            if normalized_seg == raw_seg {
+                None
+            } else {
+                find_match(normalized_seg)
+            }
         });
 
         match found {
@@ -534,6 +558,34 @@ Final thoughts.
         assert_eq!(lines[summary_idx - 1], "Appended to details.");
     }
 
+    #[test]
+    fn heading_marker_prefixed_target_matches() {
+        let r = req(
+            PatchOperation::Append,
+            PatchTargetType::Heading,
+            "## Details",
+            "Appended to details.",
+        );
+        let result = apply_patch(SAMPLE, &r, p()).unwrap();
+        let lines: Vec<&str> = result.lines().collect();
+        let summary_idx = lines.iter().position(|l| *l == "## Summary").unwrap();
+        assert_eq!(lines[summary_idx - 1], "Appended to details.");
+    }
+
+    #[test]
+    fn heading_top_level_marker_prefixed_target_matches() {
+        let r = req(
+            PatchOperation::Prepend,
+            PatchTargetType::Heading,
+            "# Introduction",
+            "Prepended line.",
+        );
+        let result = apply_patch(SAMPLE, &r, p()).unwrap();
+        let lines: Vec<&str> = result.lines().collect();
+        let idx = lines.iter().position(|l| *l == "# Introduction").unwrap();
+        assert_eq!(lines[idx + 1], "Prepended line.");
+    }
+
     // ---- Heading: replace ----
 
     #[test]
@@ -560,6 +612,20 @@ Final thoughts.
             PatchOperation::Prepend,
             PatchTargetType::Heading,
             "Introduction::Details",
+            "Nested prepend.",
+        );
+        let result = apply_patch(SAMPLE, &r, p()).unwrap();
+        let lines: Vec<&str> = result.lines().collect();
+        let idx = lines.iter().position(|l| *l == "## Details").unwrap();
+        assert_eq!(lines[idx + 1], "Nested prepend.");
+    }
+
+    #[test]
+    fn heading_marker_prefixed_nested_path_matches() {
+        let r = req(
+            PatchOperation::Prepend,
+            PatchTargetType::Heading,
+            "# Introduction::## Details",
             "Nested prepend.",
         );
         let result = apply_patch(SAMPLE, &r, p()).unwrap();
@@ -599,6 +665,45 @@ Final thoughts.
             }
             other => panic!("Expected PatchTargetNotFound, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn malformed_heading_marker_targets_do_not_match() {
+        for target in ["#Details", "####### Details"] {
+            let r = req(
+                PatchOperation::Append,
+                PatchTargetType::Heading,
+                target,
+                "content",
+            );
+            assert!(
+                matches!(
+                    apply_patch(SAMPLE, &r, p()),
+                    Err(VaultError::PatchTargetNotFound { .. })
+                ),
+                "malformed target {target:?} should not match"
+            );
+        }
+    }
+
+    #[test]
+    fn heading_hash_text_matches_raw_before_normalized_fallback() {
+        let content =
+            "# Hash Heading\nWrong target.\n\n# # Hash Heading\nRight target.\n\n# After\n";
+        let r = req(
+            PatchOperation::Append,
+            PatchTargetType::Heading,
+            "# Hash Heading",
+            "Appended.",
+        );
+        let result = apply_patch(content, &r, p()).unwrap();
+        let wrong_idx = result.find("Wrong target.").unwrap();
+        let right_idx = result.find("Right target.").unwrap();
+        let appended_idx = result.find("Appended.").unwrap();
+        let after_idx = result.find("# After").unwrap();
+        assert!(wrong_idx < right_idx);
+        assert!(right_idx < appended_idx);
+        assert!(appended_idx < after_idx);
     }
 
     // ---- Block: prepend ----

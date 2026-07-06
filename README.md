@@ -472,6 +472,8 @@ Always available. Full regex syntax for pattern matching across all notes.
 | `note_delete` | `path`, `confirm` | Delete a note (requires `confirm: true`) |
 | `note_move` | `from`, `to` | Move or rename a note |
 
+For `note_patch` heading targets, bare heading text such as `"Log"` is canonical. ATX marker-prefixed targets such as `"## Log"` are also accepted, so headings copied from `note_inspect` with `view: "targets"` can be used directly.
+
 ### Search
 
 | Tool | Parameters | Description |

@@ -57,7 +57,7 @@ pub struct NotePatchParams {
     pub operation: PatchOperation,
     /// Target type: `heading`, `block`, or `frontmatter`.
     pub target_type: PatchTargetType,
-    /// Target identifier — heading text, block ID, or frontmatter field name.
+    /// Target identifier — heading text, block ID, or frontmatter field name. For headings, bare text such as `"Log"` is canonical; ATX marker-prefixed targets such as `"## Log"` are also accepted.
     pub target: String,
     /// Content to insert or replace with.
     pub content: String,
