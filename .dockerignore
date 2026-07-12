@@ -1,0 +1,9 @@
+target/
+.git/
+tests/
+docs/
+.github/
+.gitignore
+README.md
+CLAUDE.md
+LICENSE

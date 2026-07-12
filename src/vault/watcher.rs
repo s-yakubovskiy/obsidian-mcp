@@ -69,8 +69,9 @@ pub fn start_watcher(
                 Ok(events) => {
                     let mut tantivy_dirty = false;
                     let mut embedding_dirty = false;
+                    let mut embed_requests: Vec<EmbeddingRequest> = Vec::new();
                     for event in events {
-                        let (tv_touched, emb_touched) = process_event(
+                        let (tv_touched, emb_touched, emb_req) = process_event(
                             &vault_root,
                             &index,
                             tantivy.as_deref(),
@@ -81,12 +82,32 @@ pub fn start_watcher(
                         );
                         tantivy_dirty |= tv_touched;
                         embedding_dirty |= emb_touched;
+                        if let Some(req) = emb_req {
+                            embed_requests.push(req);
+                        }
                     }
                     if tantivy_dirty
                         && let Some(ref tv) = tantivy
                         && let Err(e) = tv.flush()
                     {
                         tracing::warn!(error = %e, "tantivy batch flush failed");
+                    }
+                    // Process embedding requests via spawn_blocking to avoid
+                    // calling reqwest::blocking from within the async runtime.
+                    if let Some(ref model) = embedding_model {
+                        if let Some(ref store) = embedding_store {
+                            for req in embed_requests {
+                                let inserted = embed_and_insert(
+                                    &vault_root,
+                                    &req.relative,
+                                    &req.meta,
+                                    model,
+                                    store,
+                                )
+                                .await;
+                                embedding_dirty |= inserted;
+                            }
+                        }
                     }
                     if embedding_dirty
                         && let Some(ref store) = embedding_store
@@ -227,7 +248,19 @@ fn is_excluded_path(exclude: &ExcludeSet, relative: &Path) -> bool {
     exclude.is_excluded(Path::new(&relative.to_string_lossy().replace('\\', "/")))
 }
 
-/// Process a single debounced event. Returns `(tantivy_touched, embedding_touched)`.
+/// Metadata needed to perform an embedding update asynchronously via `spawn_blocking`.
+#[cfg(has_embeddings)]
+struct EmbeddingRequest {
+    relative: PathBuf,
+    meta: crate::models::NoteMetadata,
+}
+
+/// Process a single debounced event.
+///
+/// Returns `(tantivy_touched, embedding_removed, Option<EmbeddingRequest>)`.
+/// The optional `EmbeddingRequest` signals that the caller should embed the note
+/// via `spawn_blocking` to avoid blocking the async runtime with the synchronous
+/// HTTP client used by the API embedding backend.
 #[cfg(has_embeddings)]
 fn process_event(
     vault_root: &Path,
@@ -237,14 +270,14 @@ fn process_event(
     embedding_store: Option<&Arc<RwLock<super::embeddings::EmbeddingStore>>>,
     absolute: &Path,
     exclude: &ExcludeSet,
-) -> (bool, bool) {
+) -> (bool, bool, Option<EmbeddingRequest>) {
     if !should_process_path(vault_root, absolute) {
-        return (false, false);
+        return (false, false, None);
     }
 
     let relative = match normalized_relative_path(vault_root, absolute) {
         Some(r) => r,
-        None => return (false, false),
+        None => return (false, false, None),
     };
 
     let mut tv_touched = false;
@@ -257,7 +290,7 @@ fn process_event(
                 Ok(mut idx) => idx.add_excluded_file(&relative),
                 Err(e) => {
                     tracing::error!("index lock poisoned: {e}");
-                    return (false, false);
+                    return (false, false, None);
                 }
             }
         } else {
@@ -266,7 +299,7 @@ fn process_event(
                 Ok(mut idx) => idx.remove_file(&relative),
                 Err(e) => {
                     tracing::error!("index lock poisoned: {e}");
-                    return (false, false);
+                    return (false, false, None);
                 }
             }
         }
@@ -284,7 +317,7 @@ fn process_event(
             s.remove(&relative);
             emb_touched = true;
         }
-        return (tv_touched, emb_touched);
+        return (tv_touched, emb_touched, None);
     }
 
     if absolute.exists() {
@@ -293,13 +326,13 @@ fn process_event(
             Ok(mut idx) => {
                 if let Err(e) = idx.reindex_file(vault_root, &relative) {
                     tracing::warn!(path = %relative.display(), error = %e, "reindex failed");
-                    return (false, false);
+                    return (false, false, None);
                 }
                 idx.get_note(&relative).cloned()
             }
             Err(e) => {
                 tracing::error!("index lock poisoned: {e}");
-                return (false, false);
+                return (false, false, None);
             }
         };
         if let Some(tv) = tantivy
@@ -311,18 +344,24 @@ fn process_event(
                 tv_touched = true;
             }
         }
-        if let (Some(model), Some(store), Some(m)) =
-            (embedding_model, embedding_store, meta.as_ref())
-        {
-            emb_touched = embed_and_insert(vault_root, &relative, m, model, store);
-        }
+        // Return embedding request for async handling instead of calling
+        // the blocking HTTP client directly from this async context.
+        let emb_request = if embedding_model.is_some() && embedding_store.is_some() {
+            meta.map(|m| EmbeddingRequest {
+                relative: relative.clone(),
+                meta: m,
+            })
+        } else {
+            None
+        };
+        return (tv_touched, emb_touched, emb_request);
     } else {
         tracing::debug!(path = %relative.display(), "removing (delete)");
         match index.write() {
             Ok(mut idx) => idx.remove_file(&relative),
             Err(e) => {
                 tracing::error!("index lock poisoned: {e}");
-                return (false, false);
+                return (false, false, None);
             }
         }
         if let Some(tv) = tantivy {
@@ -340,15 +379,15 @@ fn process_event(
         }
     }
 
-    (tv_touched, emb_touched)
+    (tv_touched, emb_touched, None)
 }
 
 #[cfg(has_embeddings)]
-fn embed_and_insert(
+async fn embed_and_insert(
     vault_root: &Path,
     relative: &Path,
     meta: &crate::models::NoteMetadata,
-    model: &super::embeddings::EmbeddingModel,
+    model: &Arc<super::embeddings::EmbeddingModel>,
     store: &Arc<RwLock<super::embeddings::EmbeddingStore>>,
 ) -> bool {
     let Ok(content) = super::fs::read_file(vault_root, relative) else {
@@ -357,17 +396,28 @@ fn embed_and_insert(
     let body = super::frontmatter::get_body(&content);
     let heading_texts: Vec<String> = meta.headings.iter().map(|h| h.text.clone()).collect();
     let text = super::embeddings::prepare_embed_text(&meta.title, &heading_texts, body);
-    match model.embed_one(&text) {
-        Ok(vec) => {
+
+    let model = Arc::clone(model);
+    let store = Arc::clone(store);
+    let relative_owned = relative.to_path_buf();
+
+    let result = tokio::task::spawn_blocking(move || model.embed_one(&text)).await;
+
+    match result {
+        Ok(Ok(vec)) => {
             if let Ok(mut s) = store.write() {
-                s.insert(relative.to_path_buf(), vec);
+                s.insert(relative_owned, vec);
                 true
             } else {
                 false
             }
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::warn!(path = %relative.display(), error = %e, "embedding failed in watcher");
+            false
+        }
+        Err(e) => {
+            tracing::warn!(path = %relative.display(), error = %e, "embedding task panicked in watcher");
             false
         }
     }
