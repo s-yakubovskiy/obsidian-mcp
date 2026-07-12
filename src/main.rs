@@ -94,6 +94,9 @@ async fn serve_http(
     };
 
     let mut mcp_config = StreamableHttpServerConfig::default();
+    if config.http_host != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) {
+        mcp_config = mcp_config.disable_allowed_hosts();
+    }
     mcp_config.stateful_mode = true;
     mcp_config.json_response = true;
 
