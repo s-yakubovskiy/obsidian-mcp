@@ -10,6 +10,7 @@ use tantivy::schema::{
     Facet, Field, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder, TextFieldIndexing,
     TextOptions, Value,
 };
+use tantivy::merge_policy::NoMergePolicy;
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term, doc};
 
 use super::frontmatter;
@@ -113,6 +114,7 @@ impl TantivyIndex {
         let ts = TantivySchema::build();
         let index = Index::create_in_ram(ts.schema.clone());
         let mut writer: IndexWriter = index.writer(WRITER_HEAP_BYTES)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
 
         for (path, meta) in notes {
             let content = match fs::read_file(vault_root, path) {
