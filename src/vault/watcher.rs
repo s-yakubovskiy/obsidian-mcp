@@ -7,9 +7,10 @@
 //! become `DebouncedEventKind::Any`). We disambiguate by checking the filesystem at
 //! event time: path exists → reindex, path gone → remove.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use notify::RecursiveMode;
 use notify_debouncer_mini::{DebounceEventResult, Debouncer, new_debouncer};
@@ -64,6 +65,7 @@ pub fn start_watcher(
     tracing::info!(path = %vault_root.display(), "filesystem watcher started");
 
     tokio::spawn(async move {
+        let mut last_mtime: HashMap<PathBuf, SystemTime> = HashMap::new();
         while let Some(result) = rx.recv().await {
             match result {
                 Ok(events) => {
@@ -71,6 +73,24 @@ pub fn start_watcher(
                     let mut embedding_dirty = false;
                     let mut embed_requests: Vec<EmbeddingRequest> = Vec::new();
                     for event in events {
+                        // Skip events where mtime hasn't changed (breaks
+                        // OPEN/CLOSE_NOWRITE feedback loop from our own reads).
+                        if event.path.is_file() {
+                            if let Ok(meta) = std::fs::metadata(&event.path) {
+                                if let Ok(mtime) = meta.modified() {
+                                    if last_mtime.get(&event.path) == Some(&mtime) {
+                                        continue;
+                                    }
+                                    last_mtime.insert(event.path.clone(), mtime);
+                                }
+                            }
+                        } else if !event.path.exists() {
+                            // File was deleted — remove from cache
+                            last_mtime.remove(&event.path);
+                        } else {
+                            // Directory event — skip entirely
+                            continue;
+                        }
                         let (tv_touched, emb_touched, emb_req) = process_event(
                             &vault_root,
                             &index,
@@ -158,11 +178,30 @@ pub fn start_watcher(
     tracing::info!(path = %vault_root.display(), "filesystem watcher started");
 
     tokio::spawn(async move {
+        let mut last_mtime: HashMap<PathBuf, SystemTime> = HashMap::new();
         while let Some(result) = rx.recv().await {
             match result {
                 Ok(events) => {
                     let mut tantivy_dirty = false;
                     for event in events {
+                        // Skip events where mtime hasn't changed (breaks
+                        // OPEN/CLOSE_NOWRITE feedback loop from our own reads).
+                        if event.path.is_file() {
+                            if let Ok(meta) = std::fs::metadata(&event.path) {
+                                if let Ok(mtime) = meta.modified() {
+                                    if last_mtime.get(&event.path) == Some(&mtime) {
+                                        continue;
+                                    }
+                                    last_mtime.insert(event.path.clone(), mtime);
+                                }
+                            }
+                        } else if !event.path.exists() {
+                            // File was deleted — remove from cache
+                            last_mtime.remove(&event.path);
+                        } else {
+                            // Directory event — skip entirely
+                            continue;
+                        }
                         tantivy_dirty |= process_event(
                             &vault_root,
                             &index,
