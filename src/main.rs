@@ -117,7 +117,11 @@ async fn serve_http(
                     disabled,
                 ))
             },
-            Arc::new(LocalSessionManager::default()),
+            Arc::new({
+                let mut mgr = LocalSessionManager::default();
+                mgr.session_config.keep_alive = None;
+                mgr
+            }),
             mcp_config,
         );
 
